@@ -4,8 +4,8 @@
 # Той автоматизира създаването на LXC контейнер и пълната инсталация на UniFi Network Controller вътре в него.
 
 # --- Конфигурация на LXC контейнера ---
-CTID=150                      # ID на контейнера (променете, ако вече съществува или искате друг)
-HOSTNAME="unifi-controller"   # Име на хоста на контейнера
+CTID=$(pvesh get /cluster/nextid) # ID на контейнера (автоматично ще бъде следващото налично ID)
+HOSTNAME="unifi-$CTID"        # Име на хоста на контейнера (ще включва ID за уникалност)
 TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst" # Шаблон на ОС
 MEMORY=2048                   # RAM в MB (2GB препоръчително за UniFi)
 DISK_SIZE=10                  # Размер на диска в GB (10GB е добро начало)
@@ -23,6 +23,12 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# --- Проверка за pct команда (указва, че е Proxmox хост) ---
+if ! command -v pct >/dev/null 2>&1; then
+    echo -e "\033[1;31mГрешка: Командата 'pct' не е намерена. Моля, изпълнете този скрипт на Proxmox хост.\033[0m"
+    exit 1
+fi
+
 log_message "Стартиране на скрипта за автоматична инсталация на UniFi LXC."
 
 # --- Проверка за съществуващ CTID ---
@@ -33,7 +39,8 @@ fi
 
 # --- Намиране на сториджа с най-много свободно място ---
 log_message "Намиране на storage с най-много свободно място..."
-BEST_STORAGE=$(pvesm status --storage | awk 'NR>1 {print $1, $6}' | sort -nrk2 | head -n1 | awk '{print $1}')
+# Изключва сториджи от тип iso, backup и rootfs (които може да са вътрешни на хоста)
+BEST_STORAGE=$(pvesm status --storage | awk 'NR>1 && $1 !~ /iso|backup/ && $6 ~ /^[0-9]+$/ {print $1, $6}' | sort -nrk2 | head -n1 | awk '{print $1}')
 if [ -z "$BEST_STORAGE" ]; then
     echo -e "\033[1;31mГрешка: Не е намерен наличен storage. Моля, проверете конфигурацията на Proxmox storage-а.\033[0m"
     exit 1
@@ -42,6 +49,8 @@ log_message "Избран storage: \033[1;32m$BEST_STORAGE\033[0m"
 
 # --- Проверка и сваляне на шаблона, ако е необходимо ---
 log_message "Проверка за наличие на шаблон $TEMPLATE..."
+# Шаблонът трябва да е в поддиректория 'vztmpl' на сториджа
+TEMPLATE_PATH="$BEST_STORAGE:vztmpl/$TEMPLATE"
 if ! pveam list $BEST_STORAGE | grep -q "$TEMPLATE"; then
     log_message "Шаблонът $TEMPLATE не е намерен. Сваляне..."
     pveam download $BEST_STORAGE $TEMPLATE
@@ -54,20 +63,26 @@ else
     log_message "Шаблонът $TEMPLATE е наличен."
 fi
 
+# --- Генериране на случайна root парола ---
+ROOTPASS=$(openssl rand -base64 12)
+log_message "Генерирана root парола за контейнера: \033[1;33m$ROOTPASS\033[0m" # Отпечатва паролата за запис
+
 # --- Създаване на LXC контейнер ---
 log_message "Създаване на LXC контейнер с ID $CTID и име $HOSTNAME..."
-pct create $CTID $(pveam available | grep $TEMPLATE | awk '{print $1}') \
+pct create $CTID "$TEMPLATE_PATH" \
     -storage $BEST_STORAGE \
     -hostname $HOSTNAME \
     -memory $MEMORY \
     -cores $CORES \
-    -rootfs $BEST_STORAGE:$DISK_SIZE \
+    -rootfs "$BEST_STORAGE:$DISK_SIZE" \
     -net0 name=eth0,bridge=vmbr0,ip=dhcp \
     -unprivileged 1 \
-    -onboot 1 # Автоматично стартиране при рестарт на хоста
+    -onboot 1 \
+    -password "$ROOTPASS" \
+    -features nesting=1
 
 if [ $? -ne 0 ]; then
-    echo -e "\033[1;31mГрешка: Неуспешно създаване на LXC контейнер $CTID.\033[0m"
+    echo -e "\033[1;31mГрешка: Неуспешно създаване на LXC контейнер $CTID. Моля, проверете настройките.\033[0m"
     exit 1
 fi
 log_message "LXC контейнер $CTID е успешно създаден."
@@ -76,33 +91,27 @@ log_message "LXC контейнер $CTID е успешно създаден."
 log_message "Стартиране на контейнера $CTID..."
 pct start $CTID
 if [ $? -ne 0 ]; then
-    echo -e "\033[1;31mГрешка: Неуспешно стартиране на LXC контейнер $CTID.\033[0m"
+    echo -e "\033[1;31mГрешка: Неуспешно стартиране на LXC контейнер $CTID. Моля, проверете логовете.\033[0m"
     exit 1
 fi
 log_message "Контейнер $CTID е стартиран."
-
-# --- Задаване на фиксирана root парола ---
-log_message "Задаване на фиксирана root парола за контейнер $CTID..."
-ROOTPASS="video2022sa" # Задаване на желаната root парола
-pct exec $CTID -- bash -c "echo 'root:$ROOTPASS' | chpasswd"
-if [ $? -ne 0 ]; then
-    echo -e "\033[1;31mГрешка: Неуспешно задаване на root парола за контейнер $CTID.\033[0m"
-    exit 1
-fi
-log_message "Root паролата за контейнер $CTID е зададена."
 
 # --- Изчакване контейнерът да получи IP адрес ---
 log_message "Изчакване контейнерът $CTID да получи IP адрес (до 30 секунди)..."
 sleep_count=0
 CONTAINER_IP=""
-while [ -z "$CONTAINER_IP" ] && [ $sleep_count -lt 30 ]; do
+# Използваме 'for' цикъл за по-ясен контрол на времето за изчакване
+for i in {1..6}; do # 6 итерации * 5 секунди = 30 секунди
     sleep 5
     CONTAINER_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
-    sleep_count=$((sleep_count+5))
+    if [ -n "$CONTAINER_IP" ]; then
+        break # Излиза от цикъла, ако IP е намерено
+    fi
 done
 
+
 if [ -z "$CONTAINER_IP" ]; then
-    echo -e "\033[1;31mГрешка: Контейнерът $CTID не успя да получи IP адрес. Проверете мрежовата конфигурация.\033[0m"
+    echo -e "\033[1;31mГрешка: Контейнерът $CTID не успя да получи IP адрес в рамките на 30 секунди. Проверете мрежовата конфигурация или услугата DHCP.\033[0m"
     exit 1
 fi
 log_message "Контейнерът $CTID получи IP адрес: \033[1;36m$CONTAINER_IP\033[0m"
@@ -113,39 +122,48 @@ log_message "Стартиране на инсталация на UniFi Network C
 # Изпълняване на скрипта за инсталация на UniFi Controller в контейнера
 # Използва се heredoc за предаване на многоредови команди към pct exec
 pct exec $CTID -- bash -c "
-    # Инсталиране на основни предварителни изисквания
-    apt-get update && apt-get install -y curl gnupg apt-transport-https wget lsb-release ca-certificates
+    # Вътрешна лог функция за по-ясен изход от контейнера
+    log_message_inner() {
+        echo \"--- \$(date +'%Y-%m-%d %H:%M:%S') (Вътре в LXC) --- \$1\"
+    }
 
-    # Добавяне на UniFi хранилище и GPG ключ
+    # set -e гарантира, че скриптът ще спре, ако някоя от командите се провали
+    set -e
+
+    log_message_inner \"Инсталиране на основни предварителни изисквания...\"
+    apt-get update
+    apt-get install -y curl gnupg apt-transport-https wget lsb-release ca-certificates
+
+    log_message_inner \"Добавяне на UniFi хранилище и GPG ключ...\"
     wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | apt-key add -
     echo 'deb https://dl.ui.com/unifi/debian stable ubiquiti' | tee /etc/apt/sources.list.d/100-ubnt-unifi.list >/dev/null
 
-    # Добавяне на MongoDB хранилище и GPG ключ
+    log_message_inner \"Добавяне на MongoDB хранилище и GPG ключ за версия $MONGO_VERSION...\"
     DISTRO_ID_INNER=\$(lsb_release -is | tr '[:upper:]' '[:lower:]')
     DISTRO_CODENAME_INNER=\$(lsb_release -cs)
     MONGO_REPO_TYPE_INNER=\"debian\"
-
     if [ \"\$DISTRO_ID_INNER\" == \"ubuntu\" ]; then
         MONGO_REPO_TYPE_INNER=\"ubuntu\"
     fi
-
     wget -qO - https://www.mongodb.org/static/pgp/server-$MONGO_VERSION.asc | apt-key add -
     echo \"deb http://repo.mongodb.org/apt/\$MONGO_REPO_TYPE_INNER \$DISTRO_CODENAME_INNER/mongodb-org/$MONGO_VERSION main\" | tee /etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list >/dev/null
 
-    # Изчистване на apt кеша и актуализиране на списъците с пакети
-    apt-get clean && apt-get update
+    log_message_inner \"Изчистване на apt кеша и актуализиране на списъците с пакети...\"
+    apt-get clean
+    apt-get update # set -e ще хване грешки тук
 
-    # Инсталиране на OpenJDK 17 JRE
+    log_message_inner \"Инсталиране на OpenJDK 17 JRE...\"
     apt-get install -y openjdk-17-jre-headless
 
-    # Инсталиране на UniFi Network Controller
+    log_message_inner \"Инсталиране на UniFi Network Controller...\"
     apt-get install -y unifi
 
-    # Почистване на ненужни файлове и кеш
+    log_message_inner \"Почистване на ненужни файлове и кеш вътре в контейнера...\"
     apt-get clean && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 "
+# Проверка на exit status на pct exec командата
 if [ $? -ne 0 ]; then
-    echo -e "\033[1;31mГрешка: Инсталацията на UniFi Controller вътре в контейнера $CTID се провали. Моля, проверете логовете.\033[0m"
+    echo -e "\033[1;31mГрешка: Инсталацията на UniFi Controller вътре в контейнера $CTID се провали. Моля, проверете логовете на Proxmox или влезте в контейнера за повече информация.\033[0m"
     exit 1
 fi
 log_message "UniFi Network Controller е инсталиран успешно в контейнер $CTID."
