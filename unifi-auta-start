@@ -1,140 +1,103 @@
 #!/bin/bash
 
-# Този скрипт се изпълнява на Proxmox хост.
-# Той автоматизира създаването на LXC контейнер и пълната инсталация на UniFi Network Controller вътре в него.
+# Скрипт за автоматично създаване на LXC контейнер с UniFi Network Controller на Proxmox
+# Използване:
+#   ./install_unifi.sh [CTID] [WAIT_IP_TIMEOUT]
+# CTID - ID на контейнера (по подразбиране автоматично следващото свободно)
+# WAIT_IP_TIMEOUT - време в секунди за изчакване контейнерът да получи IP (по подразбиране 30)
 
-# --- Конфигурация на LXC контейнера ---
-CTID=$(pvesh get /cluster/nextid) # ID на контейнера (автоматично ще бъде следващото налично ID)
-HOSTNAME="unifi-$CTID"        # Име на хоста на контейнера (ще включва ID за уникалност)
-TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst" # Шаблон на ОС
-MEMORY=2048                   # RAM в MB (2GB препоръчително за UniFi)
-DISK_SIZE=10                  # Размер на диска в GB (10GB е добро начало)
-CORES=2                       # Брой CPU ядра
-MONGO_VERSION="7.0"           # Версия на MongoDB, съвместима с UniFi
+# --- Конфигурация ---
+CTID=${1:-$(pvesh get /cluster/nextid)}
+WAIT_IP_TIMEOUT=${2:-30}
 
-# --- Лог функция ---
+HOSTNAME="unifi-$CTID"
+TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+MEMORY=2048
+DISK_SIZE=10
+CORES=2
+MONGO_VERSION="7.0"
+
 log_message() {
     echo -e "\033[1;34m--- $(date +'%Y-%m-%d %H:%M:%S') --- $1\033[0m"
 }
 
-# --- Проверка за root привилегии на хоста ---
 if [[ $EUID -ne 0 ]]; then
-    echo -e "\033[1;31mГрешка: Този скрипт трябва да се изпълнява като root потребител на Proxmox хоста!\033[0m"
+    echo -e "\033[1;31mГрешка: Скриптът трябва да се стартира като root на Proxmox хост!\033[0m"
     exit 1
 fi
 
-# --- Проверка за pct команда (указва, че е Proxmox хост) ---
 if ! command -v pct >/dev/null 2>&1; then
-    echo -e "\033[1;31mГрешка: Командата 'pct' не е намерена. Моля, изпълнете този скрипт на Proxmox хост.\033[0m"
+    echo -e "\033[1;31mГрешка: 'pct' команда не е намерена. Изпълнявайте на Proxmox хост.\033[0m"
     exit 1
 fi
 
-log_message "Стартиране на скрипта за автоматична инсталация на UniFi LXC."
+log_message "Стартиране на инсталация на UniFi LXC контейнер с ID $CTID"
 
-# --- Проверка за съществуващ CTID ---
 if pct status $CTID &>/dev/null; then
-    echo -e "\033[1;31mГрешка: LXC контейнер с ID $CTID вече съществува. Моля, променете CTID в скрипта или изтрийте съществуващия контейнер.\033[0m"
+    echo -e "\033[1;31mГрешка: Контейнер с ID $CTID вече съществува. Изберете друг CTID.\033[0m"
     exit 1
 fi
 
-# --- Функция за намиране на storage с най-много свободно място ---
 get_best_storage() {
     local pvesm_output
-    # Изпълнява pvesm status (без --storage) и пренасочва stderr към stdout за улавяне на грешки
     pvesm_output=$(pvesm status 2>&1)
-    local pvesm_status_code=$?
-
-    if [ "$pvesm_status_code" -ne 0 ]; then
-        log_message "Грешка при изпълнение на 'pvesm status': $pvesm_output"
-        return 1 # Индикира провал на функцията
+    if [ $? -ne 0 ]; then
+        log_message "Грешка при 'pvesm status': $pvesm_output"
+        return 1
     fi
 
     echo "$pvesm_output" | awk '
-        BEGIN {
-            NAME_COL=-1; TYPE_COL=-1; AVAIL_COL=-1; # Инициализиране на индексите на колоните
-        }
-        NR==1 { # Заглавен ред, определяне на индексите на колоните
+        NR==1 {
             for (i=1; i<=NF; i++) {
-                if ($i == "Storage") NAME_COL=i;
-                if ($i == "Type") TYPE_COL=i;
-                if ($i == "Avail") AVAIL_COL=i;
+                if ($i == "Storage") NAME=i;
+                if ($i == "Type") TYPE=i;
+                if ($i == "Avail") AVAIL=i;
             }
-            if (NAME_COL == -1 || TYPE_COL == -1 || AVAIL_COL == -1) {
-                print "Error: Could not find \'Storage\', \'Type\', or \'Avail\' columns in pvesm status output." > "/dev/stderr";
-                exit 1; # Прекратява изпълнението на awk
-            }
-            next; # Прескача заглавния ред
+            next
         }
         {
-            # Използва определените индекси на колоните
-            storage_name=$NAME_COL
-            storage_type=$TYPE_COL
-            avail_size_str=$AVAIL_COL
+            name=$NAME; type=$TYPE; avail=$AVAIL
+            if (name ~ /(iso|backup)/ || type !~ /(dir|lvmthin|zfspool)/ || name == "") next
 
-            # Изключва сториджи, които не са подходящи за контейнери (напр. iso, backup)
-            # Филтрира по тип (dir, lvmthin, zfspool)
-            if (storage_name ~ /(iso|backup)/ || storage_type !~ /(dir|lvmthin|zfspool)/ || storage_name == "") {
-                next;
+            size=0; num=avail; unit=""
+            if (avail ~ /[KMGTPEkmgtpe]$/) {
+                unit=substr(avail,length(avail))
+                num=substr(avail,1,length(avail)-1)
             }
-            
-            # --- Логика за преобразуване на размер в мегабайти (вградена) ---
-            avail_mb = 0; # Default to 0
-            if (avail_size_str ~ /[KMGTPEkmgtpe]$/) {
-                unit_char = substr(avail_size_str, length(avail_size_str));
-                size_num = substr(avail_size_str, 1, length(avail_size_str)-1);
-                if (size_num ~ /^[0-9.]+$/) {
-                    num_value = size_num;
-                    if (unit_char == "K" || unit_char == "k") avail_mb = num_value / 1024; # KB to MB
-                    else if (unit_char == "M" || unit_char == "m") avail_mb = num_value; # MB to MB
-                    else if (unit_char == "G" || unit_char == "g") avail_mb = num_value * 1024; # GB to MB
-                    else if (unit_char == "T" || unit_char == "t") avail_mb = num_value * 1024 * 1024; # TB to MB
-                    else if (unit_char == "P" || unit_char == "p") avail_mb = num_value * 1024 * 1024 * 1024; # PB to MB
-                    else if (unit_char == "E" || unit_char == "e") avail_mb = num_value * 1024 * 1024 * 1024 * 1024; # EB to MB
-                }
-            } else if (avail_size_str ~ /^[0-9.]+$/) { # Ако е само число, приемаме че е в MB
-                avail_mb = avail_size_str;
+            if (num ~ /^[0-9.]+$/) {
+                if (unit ~ /[Kk]/) size=num/1024
+                else if (unit ~ /[Mm]/) size=num
+                else if (unit ~ /[Gg]/) size=num*1024
+                else if (unit ~ /[Tt]/) size=num*1024*1024
+                else size=num
             }
-            # --- Край на вградената логика ---
-
-            if (avail_mb > 0) { # Само ако преобразуването е успешно и стойността е положителна
-                print storage_name, avail_mb
-            }
+            if (size>0) print name, size
         }
-    ' | sort -nrk2 | head -n1 | awk '{print $1}' # Сортира числено по MB и взима името на сториджа
+    ' | sort -nrk2 | head -n1 | awk '{print $1}'
 }
 
-# --- Изпълнение на намиране на storage ---
 log_message "Намиране на storage с най-много свободно място..."
 BEST_STORAGE=$(get_best_storage)
 if [ -z "$BEST_STORAGE" ]; then
-    echo -e "\033[1;31mГрешка: Не е намерен наличен storage или възникна проблем при определянето му. Моля, проверете конфигурацията на Proxmox storage-а.\033[0m"
+    echo -e "\033[1;31mГрешка: Не е намерен подходящ storage.\033[0m"
     exit 1
 fi
-log_message "Избран storage: \033[1;32m$BEST_STORAGE\033[0m"
+log_message "Избран storage: $BEST_STORAGE"
 
-# --- Проверка и сваляне на шаблона, ако е необходимо ---
-log_message "Проверка за наличие на шаблон $TEMPLATE..."
-# Шаблонът трябва да е в поддиректория 'vztmpl' на сториджа
-TEMPLATE_PATH="$BEST_STORAGE:vztmpl/$TEMPLATE"
+log_message "Проверка за шаблон $TEMPLATE..."
 if ! pveam list $BEST_STORAGE | grep -q "$TEMPLATE"; then
-    log_message "Шаблонът $TEMPLATE не е намерен. Сваляне..."
-    pveam download $BEST_STORAGE $TEMPLATE
-    if [ $? -ne 0 ]; then
-        echo -e "\033[1;31mГрешка: Неуспешно сваляне на шаблона $TEMPLATE. Моля, проверете връзката си с интернет или името на шаблона.\033[0m"
-        exit 1
-    fi
-    log_message "Шаблонът $TEMPLATE е успешно свален."
+    log_message "Сваляне на шаблон $TEMPLATE..."
+    pveam download $BEST_STORAGE $TEMPLATE || { echo -e "\033[1;31mГрешка: Неуспешно сваляне на шаблона.\033[0m"; exit 1; }
+    log_message "Шаблонът е свален успешно."
 else
-    log_message "Шаблонът $TEMPLATE е наличен."
+    log_message "Шаблонът е наличен."
 fi
 
-# --- Генериране на случайна root парола ---
 ROOTPASS=$(openssl rand -base64 12)
-log_message "Генерирана root парола за контейнера: \033[1;33m$ROOTPASS\033[0m" # Отпечатва паролата за запис
+log_message "Генерирана root парола за контейнера: $ROOTPASS"
 
-# --- Създаване на LXC контейнер ---
-log_message "Създаване на LXC контейнер с ID $CTID и име $HOSTNAME..."
-pct create $CTID "$TEMPLATE_PATH" \
+log_message "Създаване на LXC контейнер $CTID ($HOSTNAME)..."
+pct create $CTID "$BEST_STORAGE:vztmpl/$TEMPLATE" \
     -storage "$BEST_STORAGE" \
     -hostname "$HOSTNAME" \
     -memory "$MEMORY" \
@@ -144,100 +107,69 @@ pct create $CTID "$TEMPLATE_PATH" \
     -unprivileged 1 \
     -onboot 1 \
     -password "$ROOTPASS" \
-    -features nesting=1
+    -features nesting=1 || { echo -e "\033[1;31mГрешка при създаване на контейнера.\033[0m"; exit 1; }
+log_message "Контейнерът е създаден."
 
-if [ $? -ne 0 ]; then
-    echo -e "\033[1;31mГрешка: Неуспешно създаване на LXC контейнер $CTID. Моля, проверете настройките.\033[0m"
-    exit 1
-fi
-log_message "LXC контейнер $CTID е успешно създаден."
-
-# --- Стартиране на контейнера ---
 log_message "Стартиране на контейнера $CTID..."
-pct start $CTID
-if [ $? -ne 0 ]; then
-    echo -e "\033[1;31mГрешка: Неуспешно стартиране на LXC контейнер $CTID. Моля, проверете логовете.\033[0m"
-    exit 1
-fi
-log_message "Контейнер $CTID е стартиран."
+pct start $CTID || { echo -e "\033[1;31mГрешка при стартиране на контейнера.\033[0m"; exit 1; }
+log_message "Контейнерът стартиран."
 
-# --- Изчакване контейнерът да получи IP адрес ---
-log_message "Изчакване контейнерът $CTID да получи IP адрес (до 30 секунди)..."
+log_message "Изчакване на IP адрес (до $WAIT_IP_TIMEOUT секунди)..."
 CONTAINER_IP=""
-# Използваме 'for' цикъл за по-ясен контрол на времето за изчакване
-for i in {1..6}; do # 6 итерации * 5 секунди = 30 секунди
-    sleep 5
+SLEEP_INTERVAL=5
+MAX_ITER=$((WAIT_IP_TIMEOUT / SLEEP_INTERVAL))
+
+for i in $(seq 1 $MAX_ITER); do
+    sleep $SLEEP_INTERVAL
     CONTAINER_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
     if [ -n "$CONTAINER_IP" ]; then
-        break # Излиза от цикъла, ако IP е намерено
+        break
     fi
 done
 
 if [ -z "$CONTAINER_IP" ]; then
-    echo -e "\033[1;31mГрешка: Контейнерът $CTID не успя да получи IP адрес в рамките на 30 секунди. Проверете мрежовата конфигурация или услугата DHCP.\033[0m"
+    echo -e "\033[1;31mГрешка: Контейнерът не получи IP в зададеното време.\033[0m"
     exit 1
 fi
-log_message "Контейнерът $CTID получи IP адрес: \033[1;36m$CONTAINER_IP\033[0m"
+log_message "Контейнерът получи IP: $CONTAINER_IP"
 
-# --- Инсталиране на UniFi Controller вътре в контейнера ---
-log_message "Стартиране на инсталация на UniFi Network Controller вътре в LXC контейнера $CTID..."
-
-# Изпълняване на скрипта за инсталация на UniFi Controller в контейнера
-# Използва се heredoc за предаване на многоредови команди към pct exec
+log_message "Инсталиране на UniFi Controller в контейнера..."
 pct exec $CTID -- bash -c "
-    # Вътрешна лог функция за по-ясен изход от контейнера
-    log_message_inner() {
-        echo \"--- \$(date +'%Y-%m-%d %H:%M:%S') (Вътре в LXC) --- \$1\"
-    }
-
-    # set -e гарантира, че скриптът ще спре, ако някоя от командите се провали
     set -e
+    echo '--- $(date +'%Y-%m-%d %H:%M:%S') --- Инсталиране на UniFi Controller ---'
 
-    log_message_inner \"Инсталиране на основни предварителни изисквания...\"
     apt-get update
     apt-get install -y curl gnupg apt-transport-https wget lsb-release ca-certificates
 
-    log_message_inner \"Добавяне на UniFi хранилище и GPG ключ...\"
     wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | apt-key add -
-    echo 'deb https://dl.ui.com/unifi/debian stable ubiquiti' | tee /etc/apt/sources.list.d/100-ubnt-unifi.list >/dev/null
+    echo 'deb https://dl.ui.com/unifi/debian stable ubiquiti' > /etc/apt/sources.list.d/100-ubnt-unifi.list
 
-    log_message_inner \"Добавяне на MongoDB хранилище и GPG ключ за версия $MONGO_VERSION...\"
-    DISTRO_ID_INNER=\$(lsb_release -is | tr '[:upper:]' '[:lower:]')
-    DISTRO_CODENAME_INNER=\$(lsb_release -cs)
-    MONGO_REPO_TYPE_INNER=\"debian\"
-    if [ \"\$DISTRO_ID_INNER\" == \"ubuntu\" ]; then
-        MONGO_REPO_TYPE_INNER=\"ubuntu\"
+    DISTRO_ID=\$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+    DISTRO_CODENAME=\$(lsb_release -cs)
+    MONGO_REPO_TYPE='debian'
+    if [ \"\$DISTRO_ID\" = 'ubuntu' ]; then
+        MONGO_REPO_TYPE='ubuntu'
     fi
+
     wget -qO - https://www.mongodb.org/static/pgp/server-$MONGO_VERSION.asc | apt-key add -
-    echo \"deb http://repo.mongodb.org/apt/\$MONGO_REPO_TYPE_INNER \$DISTRO_CODENAME_INNER/mongodb-org/$MONGO_VERSION main\" | tee /etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list >/dev/null
+    echo \"deb http://repo.mongodb.org/apt/\$MONGO_REPO_TYPE \$DISTRO_CODENAME/mongodb-org/$MONGO_VERSION main\" > /etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list
 
-    log_message_inner \"Изчистване на apt кеша и актуализиране на списъците с пакети...\"
     apt-get clean
-    apt-get update # set -e ще хване грешки тук
+    apt-get update
 
-    log_message_inner \"Инсталиране на OpenJDK 17 JRE...\"
-    apt-get install -y openjdk-17-jre-headless
+    apt-get install -y openjdk-17-jre-headless unifi
 
-    log_message_inner \"Инсталиране на UniFi Network Controller...\"
-    apt-get install -y unifi
-
-    log_message_inner \"Почистване на ненужни файлове и кеш вътре в контейнера...\"
     apt-get clean && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 "
-# Проверка на exit status на pct exec командата
+
 if [ $? -ne 0 ]; then
-    echo -e "\033[1;31mГрешка: Инсталацията на UniFi Controller вътре в контейнера $CTID се провали. Моля, проверете логовете на Proxmox или влезте в контейнера за повече информация.\033[0m"
+    echo -e "\033[1;31mГрешка при инсталацията на UniFi Controller.\033[0m"
     exit 1
 fi
-log_message "UniFi Network Controller е инсталиран успешно в контейнер $CTID."
 
-# --- Финален отчет ---
-echo -e "\n\033[1;32m✅ UniFi LXC контейнер $CTID е създаден и UniFi Controller е инсталиран успешно!\033[0m"
-echo -e "\033[1;35m🎉 Моля, изчакайте няколко минути, докато UniFi услугата стартира напълно.\033[0m"
-echo -e "\033[1;36m🌐 UniFi Controller Web Interface: https://$CONTAINER_IP:8443\033[0m"
-echo -e "\033[1;35m🔑 Root парола за SSH достъп до LXC $CTID: \033[1;33m$ROOTPASS\033[0m"
-echo -e "\033[1;33m⚠ Запишете генерираната root парола на сигурно място! Използвайте я за първоначален SSH достъп.\033[0m"
-echo -e "\033[1;33m⚙ След първоначалния достъп, препоръчваме да създадете стандартен потребител със sudo права и да забраните root SSH достъпа.\033[0m"
-echo -e "\033[1;35m🔥 Готово! Вашият UniFi контролер вече работи. 🔥\033[0m\n"
+echo -e "\n\033[1;32m✅ UniFi LXC контейнер $CTID е създаден и UniFi Controller инсталиран успешно!\033[0m"
+echo -e "\033[1;36m🌐 Достъп до контролера: https://$CONTAINER_IP:8443\033[0m"
+echo -e "\033[1;35m🔑 Root парола за SSH: \033[1;33m$ROOTPASS\033[0m"
+echo -e "\033[1;33m⚠ Запишете паролата на сигурно място! След това създайте потребител със sudo и забранете root SSH.\033[0m"
 
 exit 0
