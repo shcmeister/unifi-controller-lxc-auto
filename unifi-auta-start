@@ -1,133 +1,93 @@
 #!/bin/bash
-set -euo pipefail
 
-# --- Config ---
-CTID=200
-HOSTNAME="unifi-lxc"
-PASSWORD=""
-TEMPLATE_NAME="debian-12-standard_12.7-1_amd64.tar.zst"
-CORES=2
-MEMORY=4096
-DISK=18
-
-# Цветове за изход
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-NC='\033[0m' # Без цвят
-
-# Функции
-error_exit() {
-    echo -e "${RED}❌ ERROR: $1${NC}"
-    exit 1
-}
-
-success_msg() {
-    echo -e "${GREEN}✅ $1${NC}"
-}
-
-info_msg() {
-    echo -e "${CYAN}ℹ️ $1${NC}"
-}
-
-# --- Проверка дали скриптът е пуснат като root ---
-if [[ $EUID -ne 0 ]]; then
-   error_exit "Трябва да стартираш скрипта като root или с sudo."
-fi
-
-# --- Въпроси към потребителя ---
-echo "Налични сториджи в системата:"
-pvesm status | awk 'NR>1 {print "- "$1}'
-
-read -rp "Избери сторидж за шаблони (примерно local): " TEMPLATE_STORAGE
-read -rp "Избери сторидж за контейнера (rootfs) (примерно local-lvm): " ROOTFS_STORAGE
-read -rp "Въведи CTID (идентификатор на контейнера, например 200): " CTID
-read -rp "Въведи hostname за LXC (примерно unifi-lxc): " HOSTNAME
-read -rsp "Въведи парола за root на контейнера: " PASSWORD
-echo ""
-
-# --- Проверка и сваляне на template ---
-info_msg "Проверявам дали шаблонът $TEMPLATE_NAME е наличен в $TEMPLATE_STORAGE..."
-if ! pveam list $TEMPLATE_STORAGE | grep -q "$TEMPLATE_NAME"; then
-    info_msg "Шаблонът не е намерен. Свалям..."
-    pveam download $TEMPLATE_STORAGE $TEMPLATE_NAME || error_exit "Неуспешно сваляне на шаблона!"
-else
-    success_msg "Шаблонът вече е наличен."
-fi
-
-# --- Създаване на LXC контейнера ---
-info_msg "Създавам LXC контейнер $CTID с hostname $HOSTNAME..."
-pct create $CTID $TEMPLATE_STORAGE:vztmpl/$TEMPLATE_NAME \
-  --hostname $HOSTNAME \
-  --cores $CORES \
-  --memory $MEMORY \
-  --rootfs ${ROOTFS_STORAGE}:${DISK} \
-  --password $PASSWORD \
-  --features nesting=1 \
-  --net0 name=eth0,bridge=vmbr0,ip=dhcp \
-  --ostype debian || error_exit "Грешка при създаването на контейнера!"
-
-# --- Стартиране на контейнера ---
-info_msg "Стартирам контейнера..."
-pct start $CTID || error_exit "Неуспешен старт на контейнера!"
-
-# --- Инсталация на UniFi Controller вътре в контейнера ---
-
-info_msg "Инсталирам UniFi Controller вътре в контейнера..."
-
-pct exec $CTID -- bash -c "bash -s" <<'EOF'
-#!/bin/bash
 set -e
 
-log() {
-    echo "[UniFi Install] $(date +'%Y-%m-%d %H:%M:%S') $1"
+# Конфигурация
+CTID=200
+HOSTNAME="unifi-lxc"
+PASSWORD="YourSecurePass123"  # Смени паролата
+TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+CORES=2
+MEMORY=4096
+DISK=18  # GB
+
+# Функция за избор на сторидж с най-много свободно място
+select_storage() {
+    echo "ℹ️ Налични сториджи с размер и свободно място:"
+    # Извличаме информация за сториджовете, филтрираме local и Fuji*
+    pvesm status | grep -E 'local|Fuji' | awk '{print $1, $2, $4, $5}' | while read st name total free; do
+        # Преобразуваме свободното място в GB (ако е в TB или MB)
+        size=$free
+        if [[ $free == *"TB" ]]; then
+            size=$(echo "$free" | sed 's/TB//' | awk '{print $1*1024}')
+        elif [[ $free == *"MB" ]]; then
+            size=$(echo "$free" | sed 's/MB//' | awk '{print $1/1024}')
+        else
+            size=$(echo "$free" | sed 's/GB//')
+        fi
+        echo "$size $st"
+    done | sort -nr | head -n1 | awk '{print $2}'
 }
 
-log "Актуализиране на системата..."
-apt-get update && apt-get upgrade -y
+echo "🛠️ Стартиране на скрипт за UniFi LXC..."
 
-log "Инсталиране на зависимости..."
-apt-get install -y curl gnupg apt-transport-https wget lsb-release ca-certificates openjdk-17-jre-headless
+# Избор на сторидж автоматично
+ROOTFS_STORAGE=$(select_storage)
+echo "✅ Избран сторидж с най-много свободно място: $ROOTFS_STORAGE"
 
-log "Добавяне на UniFi репозитория и ключове..."
-wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | apt-key add -
-echo 'deb https://dl.ui.com/unifi/debian stable ubiquiti' > /etc/apt/sources.list.d/100-ubnt-unifi.list
-
-log "Добавяне на MongoDB 7.0 репозитория и ключове..."
-wget -qO - https://www.mongodb.org/static/pgp/server-7.0.asc | apt-key add -
-DEBIAN_CODENAME=$(lsb_release -cs)
-echo "deb http://repo.mongodb.org/apt/debian $DEBIAN_CODENAME/mongodb-org/7.0 main" > /etc/apt/sources.list.d/mongodb-org-7.0.list
-
-log "Актуализиране на пакетите..."
-apt-get update
-
-log "Инсталиране на UniFi Controller..."
-apt-get install -y unifi
-
-log "Стартиране на UniFi услугата..."
-systemctl enable unifi
-systemctl start unifi
-
-log "Инсталацията приключи успешно!"
-EOF
-
-# --- Изчакване да пусне контейнера и да получи IP ---
-info_msg "Изчаквам контейнера да стартира и да получи IP адрес..."
-
-sleep 10
-
-CONTAINER_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
-if [[ -z "$CONTAINER_IP" ]]; then
-    error_exit "Неуспях да взема IP адреса на контейнера."
+# Проверка дали шаблонът е наличен
+echo "ℹ️ Проверявам дали шаблонът $TEMPLATE е наличен в сторидж $ROOTFS_STORAGE..."
+if ! pveam list $ROOTFS_STORAGE | grep -q "$TEMPLATE"; then
+    echo "ℹ️ Шаблонът не е намерен. Свалям..."
+    pveam download $ROOTFS_STORAGE $TEMPLATE || { echo "❌ ERROR: Неуспешно сваляне на шаблона!"; exit 1; }
+else
+    echo "✅ Шаблонът вече е наличен."
 fi
 
-# --- Финален статус ---
-echo -e "\n${GREEN}🎉 Инсталацията е завършена успешно!${NC}"
-echo -e "${CYAN}👉 UniFi Controller е достъпен на следния адрес:${NC}"
-echo -e "${GREEN}https://${CONTAINER_IP}:8443${NC}"
-echo -e "${CYAN}Увери се, че порт 8443 е отворен във firewall-а.${NC}"
-echo -e "${GREEN}За статус на услугата вътре в контейнера използвай:${NC} pct exec $CTID -- systemctl status unifi"
-echo -e "${GREEN}За логове:${NC} pct exec $CTID -- tail -f /var/log/unifi/server.log"
-echo ""
+# Създаване на LXC контейнер
+echo "🚀 Създавам LXC контейнер $CTID..."
+pct create $CTID $ROOTFS_STORAGE:vztmpl/$TEMPLATE \
+    --hostname $HOSTNAME \
+    --cores $CORES \
+    --memory $MEMORY \
+    --rootfs $ROOTFS_STORAGE:${DISK} \
+    --password $PASSWORD \
+    --features nesting=1 \
+    --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+    --ostype debian
+
+# Автоматичен старт на контейнера при boot
+pct set $CTID --onboot 1
+
+# Стартиране на контейнера
+echo "⚡ Стартирам контейнера..."
+pct start $CTID
+
+# Изчакваме контейнера да се стартира и да получи IP
+echo "⏳ Изчакваме контейнера да се стартира и да получи IP адрес..."
+sleep 15
+
+# Взимаме IP-то на контейнера
+CONTAINER_IP=$(pct exec $CTID ip a show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+if [ -z "$CONTAINER_IP" ]; then
+    echo "❌ Неуспешно получаване на IP адреса на контейнера. Провери DHCP конфигурацията."
+else
+    echo "✅ Контейнерът е стартиран. IP адрес: $CONTAINER_IP"
+fi
+
+# Инсталиране на UniFi Controller вътре в LXC-то
+echo "📦 Инсталирам UniFi Controller в контейнера..."
+
+pct exec $CTID bash -c "
+apt-get update && apt-get install -y curl gnupg apt-transport-https openjdk-17-jre-headless wget lsb-release ca-certificates &&
+wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | apt-key add - &&
+echo 'deb https://dl.ui.com/unifi/debian stable ubiquiti' > /etc/apt/sources.list.d/100-ubnt-unifi.list &&
+apt-get update &&
+apt-get install -y unifi
+"
+
+echo -e "\n🎉 \033[1;32mUniFi Controller е инсталиран успешно!\033[0m"
+echo -e "🌐 Отвори в браузър: \033[1;36mhttps://$CONTAINER_IP:8443\033[0m"
+echo -e "🔥 Контейнерът ще стартира автоматично при рестарт на Proxmox."
 
 exit 0
