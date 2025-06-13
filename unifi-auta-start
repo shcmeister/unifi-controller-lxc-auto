@@ -52,24 +52,6 @@ get_best_storage() {
     echo "$pvesm_output" | awk '
         BEGIN {
             NAME_COL=-1; TYPE_COL=-1; AVAIL_COL=-1; # Инициализиране на индексите на колоните
-            # Функции за преобразуване на размер в мегабайти
-            function convert_to_mb(size_str) {
-                if (size_str ~ /[KMGTPEkmgtpe]$/) {
-                    unit_char = substr(size_str, length(size_str));
-                    size_num = substr(size_str, 1, length(size_str)-1);
-                    if (size_num !~ /^[0-9.]+$/) return 0; # Невалидно число
-                    num_value = size_num;
-                    if (unit_char == "K" || unit_char == "k") return num_value / 1024; # KB to MB
-                    else if (unit_char == "M" || unit_char == "m") return num_value; # MB to MB
-                    else if (unit_char == "G" || unit_char == "g") return num_value * 1024; # GB to MB
-                    else if (unit_char == "T" || unit_char == "t") return num_value * 1024 * 1024; # TB to MB
-                    else if (unit_char == "P" || unit_char == "p") return num_value * 1024 * 1024 * 1024; # PB to MB
-                    else if (unit_char == "E" || unit_char == "e") return num_value * 1024 * 1024 * 1024 * 1024; # EB to MB
-                } else if (size_str ~ /^[0-9.]+$/) { # Ако е само число, приемаме че е в MB
-                    return size_str;
-                }
-                return 0; # Неразпознат формат
-            }
         }
         NR==1 { # Заглавен ред, определяне на индексите на колоните
             for (i=1; i<=NF; i++) {
@@ -78,7 +60,7 @@ get_best_storage() {
                 if ($i == "Avail") AVAIL_COL=i;
             }
             if (NAME_COL == -1 || TYPE_COL == -1 || AVAIL_COL == -1) {
-                print "Error: Could not find 'Storage', 'Type', or 'Avail' columns in pvesm status output." > "/dev/stderr";
+                print "Error: Could not find \'Storage\', \'Type\', or \'Avail\' columns in pvesm status output." > "/dev/stderr";
                 exit 1; # Прекратява изпълнението на awk
             }
             next; # Прескача заглавния ред
@@ -95,9 +77,26 @@ get_best_storage() {
                 next;
             }
             
-            # Преобразува наличния размер в MB за сравнение
-            avail_mb = convert_to_mb(avail_size_str);
-            if (avail_mb > 0) { # Само ако преобразуването е успешно
+            # --- Логика за преобразуване на размер в мегабайти (вградена) ---
+            avail_mb = 0; # Default to 0
+            if (avail_size_str ~ /[KMGTPEkmgtpe]$/) {
+                unit_char = substr(avail_size_str, length(avail_size_str));
+                size_num = substr(avail_size_str, 1, length(avail_size_str)-1);
+                if (size_num ~ /^[0-9.]+$/) {
+                    num_value = size_num;
+                    if (unit_char == "K" || unit_char == "k") avail_mb = num_value / 1024; # KB to MB
+                    else if (unit_char == "M" || unit_char == "m") avail_mb = num_value; # MB to MB
+                    else if (unit_char == "G" || unit_char == "g") avail_mb = num_value * 1024; # GB to MB
+                    else if (unit_char == "T" || unit_char == "t") avail_mb = num_value * 1024 * 1024; # TB to MB
+                    else if (unit_char == "P" || unit_char == "p") avail_mb = num_value * 1024 * 1024 * 1024; # PB to MB
+                    else if (unit_char == "E" || unit_char == "e") avail_mb = num_value * 1024 * 1024 * 1024 * 1024; # EB to MB
+                }
+            } else if (avail_size_str ~ /^[0-9.]+$/) { # Ако е само число, приемаме че е в MB
+                avail_mb = avail_size_str;
+            }
+            # --- Край на вградената логика ---
+
+            if (avail_mb > 0) { # Само ако преобразуването е успешно и стойността е положителна
                 print storage_name, avail_mb
             }
         }
