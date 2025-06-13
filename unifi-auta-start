@@ -1,138 +1,162 @@
 #!/bin/bash
-set -euo pipefail
 
-# Този скрипт автоматизира инсталацията на най-новата версия на UniFi Network Controller
-# в LXC контейнер, базиран на Debian/Ubuntu.
-# Той управлява настройката на хранилища, импортирането на GPG ключове, зависимостите и инсталацията на UniFi пакета.
+# Този скрипт се изпълнява на Proxmox хост.
+# Той автоматизира създаването на LXC контейнер и пълната инсталация на UniFi Network Controller вътре в него.
 
-# --- Конфигурация ---
-MONGO_VERSION="7.0"
+# --- Конфигурация на LXC контейнера ---
+CTID=150                      # ID на контейнера (променете, ако вече съществува или искате друг)
+HOSTNAME="unifi-controller"   # Име на хоста на контейнера
+TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst" # Шаблон на ОС
+MEMORY=2048                   # RAM в MB (2GB препоръчително за UniFi)
+DISK_SIZE=10                  # Размер на диска в GB (10GB е добро начало)
+CORES=2                       # Брой CPU ядра
+MONGO_VERSION="7.0"           # Версия на MongoDB, съвместима с UniFi
 
-# --- Функции ---
-
+# --- Лог функция ---
 log_message() {
-    echo "--- $(date +'%Y-%m-%d %H:%M:%S') --- $1"
+    echo -e "\033[1;34m--- $(date +'%Y-%m-%d %H:%M:%S') --- $1\033[0m"
 }
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_message "Този скрипт трябва да се изпълнява като root. Моля, използвайте sudo или влезте като root."
+# --- Проверка за root привилегии на хоста ---
+if [[ $EUID -ne 0 ]]; then
+    echo -e "\033[1;31mГрешка: Този скрипт трябва да се изпълнява като root потребител на Proxmox хоста!\033[0m"
+    exit 1
+fi
+
+log_message "Стартиране на скрипта за автоматична инсталация на UniFi LXC."
+
+# --- Проверка за съществуващ CTID ---
+if pct status $CTID &>/dev/null; then
+    echo -e "\033[1;31mГрешка: LXC контейнер с ID $CTID вече съществува. Моля, променете CTID в скрипта или изтрийте съществуващия контейнер.\033[0m"
+    exit 1
+fi
+
+# --- Намиране на сториджа с най-много свободно място ---
+log_message "Намиране на storage с най-много свободно място..."
+BEST_STORAGE=$(pvesm status --storage | awk 'NR>1 {print $1, $6}' | sort -nrk2 | head -n1 | awk '{print $1}')
+if [ -z "$BEST_STORAGE" ]; then
+    echo -e "\033[1;31mГрешка: Не е намерен наличен storage. Моля, проверете конфигурацията на Proxmox storage-а.\033[0m"
+    exit 1
+fi
+log_message "Избран storage: \033[1;32m$BEST_STORAGE\033[0m"
+
+# --- Проверка и сваляне на шаблона, ако е необходимо ---
+log_message "Проверка за наличие на шаблон $TEMPLATE..."
+if ! pveam list $BEST_STORAGE | grep -q "$TEMPLATE"; then
+    log_message "Шаблонът $TEMPLATE не е намерен. Сваляне..."
+    pveam download $BEST_STORAGE $TEMPLATE
+    if [ $? -ne 0 ]; then
+        echo -e "\033[1;31mГрешка: Неуспешно сваляне на шаблона $TEMPLATE. Моля, проверете връзката си с интернет или името на шаблона.\033[0m"
         exit 1
     fi
-}
+    log_message "Шаблонът $TEMPLATE е успешно свален."
+else
+    log_message "Шаблонът $TEMPLATE е наличен."
+fi
 
-detect_distro_info() {
-    if [ -f "/etc/os-release" ]; then
-        . /etc/os-release
-        DISTRO_ID=$ID
-        DISTRO_CODENAME=$VERSION_CODENAME
-    elif [ -f "/etc/debian_version" ]; then
-        DISTRO_ID="debian"
-        DISTRO_CODENAME=$(lsb_release -cs 2>/dev/null || echo "bookworm")
-    else
-        log_message "Не може да се разпознае дистрибуцията. Този скрипт е предназначен за Debian/Ubuntu."
-        exit 1
+# --- Създаване на LXC контейнер ---
+log_message "Създаване на LXC контейнер с ID $CTID и име $HOSTNAME..."
+pct create $CTID $(pveam available | grep $TEMPLATE | awk '{print $1}') \
+    -storage $BEST_STORAGE \
+    -hostname $HOSTNAME \
+    -memory $MEMORY \
+    -cores $CORES \
+    -rootfs $BEST_STORAGE:$DISK_SIZE \
+    -net0 name=eth0,bridge=vmbr0,ip=dhcp \
+    -unprivileged 1 \
+    -onboot 1 # Автоматично стартиране при рестарт на хоста
+
+if [ $? -ne 0 ]; then
+    echo -e "\033[1;31mГрешка: Неуспешно създаване на LXC контейнер $CTID.\033[0m"
+    exit 1
+fi
+log_message "LXC контейнер $CTID е успешно създаден."
+
+# --- Стартиране на контейнера ---
+log_message "Стартиране на контейнера $CTID..."
+pct start $CTID
+if [ $? -ne 0 ]; then
+    echo -e "\033[1;31mГрешка: Неуспешно стартиране на LXC контейнер $CTID.\033[0m"
+    exit 1
+fi
+log_message "Контейнер $CTID е стартиран."
+
+# --- Задаване на фиксирана root парола ---
+log_message "Задаване на фиксирана root парола за контейнер $CTID..."
+ROOTPASS="video2022sa" # Задаване на желаната root парола
+pct exec $CTID -- bash -c "echo 'root:$ROOTPASS' | chpasswd"
+if [ $? -ne 0 ]; then
+    echo -e "\033[1;31mГрешка: Неуспешно задаване на root парола за контейнер $CTID.\033[0m"
+    exit 1
+fi
+log_message "Root паролата за контейнер $CTID е зададена."
+
+# --- Изчакване контейнерът да получи IP адрес ---
+log_message "Изчакване контейнерът $CTID да получи IP адрес (до 30 секунди)..."
+sleep_count=0
+CONTAINER_IP=""
+while [ -z "$CONTAINER_IP" ] && [ $sleep_count -lt 30 ]; do
+    sleep 5
+    CONTAINER_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
+    sleep_count=$((sleep_count+5))
+done
+
+if [ -z "$CONTAINER_IP" ]; then
+    echo -e "\033[1;31mГрешка: Контейнерът $CTID не успя да получи IP адрес. Проверете мрежовата конфигурация.\033[0m"
+    exit 1
+fi
+log_message "Контейнерът $CTID получи IP адрес: \033[1;36m$CONTAINER_IP\033[0m"
+
+# --- Инсталиране на UniFi Controller вътре в контейнера ---
+log_message "Стартиране на инсталация на UniFi Network Controller вътре в LXC контейнера $CTID..."
+
+# Изпълняване на скрипта за инсталация на UniFi Controller в контейнера
+# Използва се heredoc за предаване на многоредови команди към pct exec
+pct exec $CTID -- bash -c "
+    # Инсталиране на основни предварителни изисквания
+    apt-get update && apt-get install -y curl gnupg apt-transport-https wget lsb-release ca-certificates
+
+    # Добавяне на UniFi хранилище и GPG ключ
+    wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | apt-key add -
+    echo 'deb https://dl.ui.com/unifi/debian stable ubiquiti' | tee /etc/apt/sources.list.d/100-ubnt-unifi.list >/dev/null
+
+    # Добавяне на MongoDB хранилище и GPG ключ
+    DISTRO_ID_INNER=\$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+    DISTRO_CODENAME_INNER=\$(lsb_release -cs)
+    MONGO_REPO_TYPE_INNER=\"debian\"
+
+    if [ \"\$DISTRO_ID_INNER\" == \"ubuntu\" ]; then
+        MONGO_REPO_TYPE_INNER=\"ubuntu\"
     fi
 
-    log_message "Разпозната дистрибуция: $DISTRO_ID, кодово име: $DISTRO_CODENAME"
+    wget -qO - https://www.mongodb.org/static/pgp/server-$MONGO_VERSION.asc | apt-key add -
+    echo \"deb http://repo.mongodb.org/apt/\$MONGO_REPO_TYPE_INNER \$DISTRO_CODENAME_INNER/mongodb-org/$MONGO_VERSION main\" | tee /etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list >/dev/null
 
-    if [[ "$DISTRO_ID" != "debian" && "$DISTRO_ID" != "ubuntu" ]]; then
-        log_message "Неподдържана дистрибуция: $DISTRO_ID. Този скрипт е за Debian или Ubuntu."
-        exit 1
-    fi
-}
+    # Изчистване на apt кеша и актуализиране на списъците с пакети
+    apt-get clean && apt-get update
 
-install_prerequisites() {
-    log_message "Инсталиране на основните предварителни изисквания..."
-    apt-get update
-    apt-get install -y curl gnupg apt-transport-https wget lsb-release ca-certificates
-    log_message "Предварителните изисквания са инсталирани."
-}
-
-add_unifi_repo() {
-    log_message "Добавяне на UniFi хранилище и GPG ключ..."
-    local UNIFI_REPO_KEY_URL="https://dl.ui.com/unifi/unifi-repo.gpg"
-    local UNIFI_REPO_FILE="/etc/apt/sources.list.d/100-ubnt-unifi.list"
-
-    rm -f /etc/apt/sources.list.d/*ubnt*.list
-
-    wget -qO - "$UNIFI_REPO_KEY_URL" | apt-key add -
-    log_message "UniFi GPG ключ добавен."
-
-    echo "deb https://dl.ui.com/unifi/debian stable ubiquiti" | tee "$UNIFI_REPO_FILE" >/dev/null
-    log_message "UniFi хранилище добавено."
-}
-
-add_mongodb_repo() {
-    log_message "Добавяне на MongoDB хранилище и GPG ключ за версия $MONGO_VERSION..."
-
-    local MONGO_REPO_KEY_URL="https://www.mongodb.org/static/pgp/server-$MONGO_VERSION.asc"
-    local MONGO_REPO_FILE="/etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list"
-
-    rm -f /etc/apt/sources.list.d/*mongodb*.list
-
-    wget -qO - "$MONGO_REPO_KEY_URL" | apt-key add -
-    log_message "MongoDB GPG ключ добавен."
-
-    if [[ "$DISTRO_ID" == "ubuntu" ]]; then
-        echo "deb [arch=amd64] https://repo.mongodb.org/apt/ubuntu $DISTRO_CODENAME/mongodb-org/$MONGO_VERSION multiverse" | tee "$MONGO_REPO_FILE" >/dev/null
-    else
-        echo "deb [arch=amd64] http://repo.mongodb.org/apt/debian $DISTRO_CODENAME/mongodb-org/$MONGO_VERSION main" | tee "$MONGO_REPO_FILE" >/dev/null
-    fi
-    log_message "MongoDB хранилище добавено."
-}
-
-perform_apt_update() {
-    log_message "Изчистване на apt кеша и актуализиране на списъците с пакети..."
-    apt-get clean
-    apt-get update
-    log_message "Списъците с пакети са актуализирани."
-}
-
-install_java() {
-    log_message "Инсталиране на OpenJDK 17 JRE (изисква се от UniFi)..."
+    # Инсталиране на OpenJDK 17 JRE
     apt-get install -y openjdk-17-jre-headless
-    log_message "OpenJDK 17 JRE е инсталиран."
-}
 
-install_unifi() {
-    log_message "Инсталиране на UniFi Network Controller..."
+    # Инсталиране на UniFi Network Controller
     apt-get install -y unifi
-    log_message "UniFi Network Controller е инсталиран успешно."
-}
 
-check_unifi_status() {
-    if systemctl is-active --quiet unifi; then
-        log_message "UniFi услугата работи нормално."
-    else
-        log_message "Внимание: UniFi услугата не работи или има проблем."
-    fi
-}
+    # Почистване на ненужни файлове и кеш
+    apt-get clean && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+"
+if [ $? -ne 0 ]; then
+    echo -e "\033[1;31mГрешка: Инсталацията на UniFi Controller вътре в контейнера $CTID се провали. Моля, проверете логовете.\033[0m"
+    exit 1
+fi
+log_message "UniFi Network Controller е инсталиран успешно в контейнер $CTID."
 
-print_final_info() {
-    sleep 10
-    CONTAINER_IP=$(hostname -I | awk '{print $1}')
-    log_message "\033[1;32m✅ Инсталацията на UniFi Controller е завършена и работи!\033[0m"
-    log_message "Можете да достъпите уеб интерфейса на UniFi Controller на адрес: \033[1;36mhttps://$CONTAINER_IP:8443\033[0m"
-    log_message "Уверете се, че правилата на защитната стена позволяват трафик към порт 8443 (и 8080, 8443, 3478/udp, 10001/udp, ако е приложимо)."
-    log_message "Проверете състоянието на услугата UniFi с: systemctl status unifi"
-    log_message "Логовете на UniFi може да видите с: tail -f /var/log/unifi/server.log"
-    log_message "\033[1;35m🎉 Всички задачи приключиха! Вашият UniFi Controller вече трябва да е достъпен. 🎉\033[0m"
-}
+# --- Финален отчет ---
+echo -e "\n\033[1;32m✅ UniFi LXC контейнер $CTID е създаден и UniFi Controller е инсталиран успешно!\033[0m"
+echo -e "\033[1;35m🎉 Моля, изчакайте няколко минути, докато UniFi услугата стартира напълно.\033[0m"
+echo -e "\033[1;36m🌐 UniFi Controller Web Interface: https://$CONTAINER_IP:8443\033[0m"
+echo -e "\033[1;35m🔑 Root парола за SSH достъп до LXC $CTID: \033[1;33m$ROOTPASS\033[0m"
+echo -e "\033[1;33m⚠ Запишете генерираната root парола на сигурно място! Използвайте я за първоначален SSH достъп.\033[0m"
+echo -e "\033[1;33m⚙ След първоначалния достъп, препоръчваме да създадете стандартен потребител със sudo права и да забраните root SSH достъпа.\033[0m"
+echo -e "\033[1;35m🔥 Готово! Вашият UniFi контролер вече работи. 🔥\033[0m\n"
 
-main() {
-    log_message "Стартиране на скрипта за инсталация на UniFi Controller."
-    check_root
-    detect_distro_info
-    install_prerequisites
-    add_unifi_repo
-    add_mongodb_repo
-    perform_apt_update
-    install_java
-    install_unifi
-    check_unifi_status
-    print_final_info
-}
-
-main "$@"
 exit 0
