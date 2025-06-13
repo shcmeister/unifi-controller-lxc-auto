@@ -1,0 +1,85 @@
+#!/bin/bash
+
+set -e
+
+# --- Конфиг ---
+CTID=200
+HOSTNAME="unifi-lxc"
+PASSWORD="YourSecurePass123"  # смени с твоя парола
+CORES=2
+MEMORY=4096
+DISK=18
+
+# --- Функции за съобщения ---
+error_msg() { echo -e "\e[31m❌ $1\e[0m"; }
+success_msg() { echo -e "\e[32m✅ $1\e[0m"; }
+info_msg() { echo -e "\e[34mℹ️ $1\e[0m"; }
+
+# --- Избира storage ---
+STORAGE=$(pvesm status | awk 'NR>1 {print $1}' | head -n1)
+if [ -z "$STORAGE" ]; then
+  error_msg "Няма открит storage в Proxmox. Добави поне един и пробвай пак."
+  exit 1
+fi
+info_msg "Избран storage: $STORAGE"
+
+# --- Избира Debian 12 template ---
+TEMPLATE=$(pveam available | grep debian-12-standard | head -n1)
+if [ -z "$TEMPLATE" ]; then
+  error_msg "Не намерих Debian 12 template за сваляне."
+  exit 1
+fi
+info_msg "Избран template: $TEMPLATE"
+
+# --- Проверка и сваляне на template ---
+if ! pveam list $STORAGE | grep -q "$TEMPLATE"; then
+  info_msg "Сваляне на template $TEMPLATE..."
+  pveam download $STORAGE $TEMPLATE
+else
+  success_msg "Template $TEMPLATE вече е наличен."
+fi
+
+# --- Създаване на контейнера ---
+info_msg "Създаване на LXC с ID $CTID..."
+pct create $CTID $STORAGE:vztmpl/$TEMPLATE \
+  --hostname $HOSTNAME \
+  --cores $CORES \
+  --memory $MEMORY \
+  --rootfs ${STORAGE}:${DISK} \
+  --password $PASSWORD \
+  --features nesting=1 \
+  --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+  --ostype debian \
+  --onboot 1
+
+# --- Стартиране на контейнера ---
+info_msg "Стартиране на контейнера..."
+pct start $CTID
+
+# --- Инсталация UniFi Controller ---
+info_msg "Инсталиране на UniFi Controller вътре в контейнера..."
+pct exec $CTID -- bash -c "
+apt-get update && \
+apt-get install -y curl gnupg apt-transport-https wget lsb-release ca-certificates openjdk-17-jre-headless && \
+wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | gpg --dearmor -o /usr/share/keyrings/unifi-archive-keyring.gpg && \
+echo 'deb [signed-by=/usr/share/keyrings/unifi-archive-keyring.gpg] https://dl.ui.com/unifi/debian stable ubiquiti' > /etc/apt/sources.list.d/unifi.list && \
+wget -qO - https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-archive-keyring.gpg && \
+echo 'deb [signed-by=/usr/share/keyrings/mongodb-archive-keyring.gpg] http://repo.mongodb.org/apt/debian bookworm/mongodb-org/7.0 main' > /etc/apt/sources.list.d/mongodb.list && \
+apt-get update && \
+apt-get install -y unifi && \
+systemctl enable --now unifi
+"
+
+# --- Вземане на IP ---
+info_msg "Изчаквам контейнера да получи IP..."
+sleep 10
+IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
+
+if [ -z "$IP" ]; then
+  error_msg "Не успях да взема IP на контейнера. Провери DHCP настройките."
+else
+  success_msg "Контейнерът работи с IP: $IP"
+  echo -e "\e[1;36m🌐 Достъп до UniFi Controller: https://$IP:8443\e[0m"
+fi
+
+success_msg "🎉 Всичко е инсталирано успешно и UniFi Controller трябва да работи."
