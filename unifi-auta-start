@@ -2,7 +2,7 @@
 
 # ==============================================
 # Автоматична инсталация на UniFi Controller в LXC
-# Версия без pvesm list
+# Финална работна версия
 # ==============================================
 
 # Проверка за root
@@ -32,8 +32,13 @@ select_storage() {
   echo "Налични storage устройства:"
   echo "--------------------------"
   
-  # Използваме алтернативен метод за получаване на storage списък
-  STORAGE_LIST=$(cat /etc/pve/storage.cfg | grep -Po '^\w+(?=\s+)' | sort | uniq)
+  # Надежден метод за получаване на storage списък
+  STORAGE_LIST=$(grep -Po '^\w+(?=\s+)' /etc/pve/storage.cfg 2>/dev/null | sort | uniq)
+  if [ -z "$STORAGE_LIST" ]; then
+    echo "Грешка: Не мога да получа списък със storage устройства!"
+    exit 1
+  fi
+  
   echo "$STORAGE_LIST"
   echo "--------------------------"
   
@@ -50,7 +55,7 @@ select_storage() {
 # Създаване на контейнер
 create_container() {
   echo "Създаване на LXC контейнер..."
-  pct create $CTID \
+  if ! pct create $CTID \
     -storage "$STORAGE" \
     -hostname "$HOSTNAME" \
     -password "$PASSWORD" \
@@ -61,8 +66,12 @@ create_container() {
     -unprivileged 1 \
     -features nesting=1 \
     -ostype debian \
-    -rootfs "$STORAGE:$DISK_SIZE"
+    -rootfs "$STORAGE:$DISK_SIZE"; then
+    echo "Грешка при създаване на контейнер!"
+    exit 1
+  fi
 
+  echo "Стартиране на контейнер..."
   pct start $CTID
   sleep 10
 }
@@ -81,10 +90,29 @@ install_unifi() {
   '
 }
 
+# Функция за получаване на IP адрес
+get_container_ip() {
+  local max_retries=10
+  local retry=0
+  
+  while [ $retry -lt $max_retries ]; do
+    IP=$(pct exec $CTID -- ip route get 1 2>/dev/null | awk '{print $7}' | head -1)
+    if [ -n "$IP" ]; then
+      echo "$IP"
+      return 0
+    fi
+    sleep 3
+    ((retry++))
+  done
+  
+  echo "Грешка: Контейнерът не получи IP адрес!"
+  exit 1
+}
+
 # Показване на информация
 show_info() {
   clear
-  IP=$(pct exec $CTID ip -4 -o addr show eth0 | awk '{print $4}' | cut -d'/' -f1)
+  IP=$(get_container_ip)
   
   echo "=============================================="
   echo " Инсталацията завърши успешно!"
