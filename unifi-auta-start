@@ -2,7 +2,7 @@
 
 # ==============================================
 # Скрипт за инсталация на UniFi Controller в LXC
-# Версия: 3.1 (ръчен избор на storage)
+# Версия: 3.2 (поправена синтактична грешка)
 # ==============================================
 
 # --- Конфигурация ---
@@ -30,11 +30,12 @@ log() {
     local message=$2
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     
-    case $level in
+    case "$level" in
         "INFO") echo -e "${BLUE}[${timestamp}] INFO: ${message}${NC}" ;;
         "WARN") echo -e "${YELLOW}[${timestamp}] WARN: ${message}${NC}" ;;
         "ERROR") echo -e "${RED}[${timestamp}] ERROR: ${message}${NC}" ;;
         "SUCCESS") echo -e "${GREEN}[${timestamp}] SUCCESS: ${message}${NC}" ;;
+        *) echo -e "[${timestamp}] ${message}" ;;
     esac
 }
 
@@ -73,7 +74,7 @@ select_storage() {
     echo "----------------------------------------"
     
     while true; do
-        read -p "Моля, въведете името на storage устройството, където искате да инсталирате контейнера: " storage
+        read -p "Моля, въведете името на storage устройството: " storage
         if pvesm list | grep -q "^${storage}\s"; then
             log "INFO" "Избрахте storage: $storage"
             echo "$storage"
@@ -89,7 +90,6 @@ create_container() {
     local storage=$1
     log "INFO" "Подготвяне за създаване на контейнер..."
     
-    # Проверка за шаблона
     if ! pveam list $storage | grep -q "$TEMPLATE"; then
         log "INFO" "Сваляне на шаблон $TEMPLATE..."
         pveam download $storage $TEMPLATE || {
@@ -98,12 +98,10 @@ create_container() {
         }
     fi
 
-    # Генериране на парола
     local root_pass=$(openssl rand -base64 12)
     log "INFO" "Генерирана root парола: $root_pass"
     
-    # Създаване на контейнера
-    log "INFO" "Създаване на контейнер $CTID на storage $storage..."
+    log "INFO" "Създаване на контейнер $CTID..."
     pct create $CTID "$storage:vztmpl/$TEMPLATE" \
         --storage $storage \
         --hostname $HOSTNAME \
@@ -132,8 +130,7 @@ setup_unifi() {
         exit 1;
     }
     
-    # Изчакване за IP адрес
-    log "INFO" "Изчакване за IP адрес (до 30 секунди)..."
+    log "INFO" "Изчакване за IP адрес..."
     local ip=""
     for i in {1..10}; do
         ip=$(pct exec $CTID ip -4 -o addr show eth0 | awk '{print $4}' | cut -d'/' -f1)
@@ -148,7 +145,6 @@ setup_unifi() {
     
     log "SUCCESS" "Контейнерът получи IP: $ip"
     
-    # Инсталация на UniFi
     log "INFO" "Започва инсталация на UniFi Controller..."
     pct exec $CTID -- bash -c '
         set -e
@@ -179,10 +175,10 @@ setup_unifi() {
         apt-get install -yq unifi
         
         echo "[$(date "+%Y-%m-%d %H:%M:%S")] Конфигуриране на защитната стена..."
-        ufw allow 8080/tcp    # Управление на устройства
-        ufw allow 8443/tcp    # Управляващ интерфейс
-        ufw allow 3478/udp    # STUN
-        ufw allow 10001/udp   # AP discovery
+        ufw allow 8080/tcp
+        ufw allow 8443/tcp
+        ufw allow 3478/udp
+        ufw allow 10001/udp
         ufw --force enable
         
         echo "[$(date "+%Y-%m-%d %H:%M:%S")] Оптимизиране на системата..."
@@ -232,8 +228,7 @@ main() {
     echo -e " ${BLUE}●${NC} Уеб интерфейс: ${YELLOW}https://$ip:8443${NC}"
     echo -e " ${BLUE}●${NC} Root парола: ${YELLOW}$root_pass${NC}"
     echo -e "${GREEN}"
-    echo " Забележка: Може да отнеме 2-3 минути, докато"
-    echo " UniFi услугата напълно се инициализира."
+    echo " Забележка: Може да отнеме 2-3 минути за инициализация"
     echo "=============================================="
     echo -e "${NC}"
 }
