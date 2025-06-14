@@ -2,7 +2,7 @@
 
 # ==============================================
 # Автоматична инсталация на UniFi Controller в LXC
-# Напълно работеща версия
+# Финален работещ вариант
 # ==============================================
 
 # Проверка за root
@@ -32,18 +32,13 @@ select_storage() {
   echo "Налични storage устройства:"
   echo "--------------------------"
   
-  # Надежден метод за получаване на storage списък
   STORAGE_LIST=$(pvesm status -content rootdir | awk 'NR>1 {print $1}')
   if [ -z "$STORAGE_LIST" ]; then
     echo "Грешка: Не мога да получа списък със storage устройства!"
-    echo "Проверете дали имате конфигурирани storage устройства в Proxmox."
     exit 1
   fi
   
-  echo "$STORAGE_LIST"
-  echo "--------------------------"
-  
-  PS3="Моля изберете storage устройство: "
+  # Показване на storage устройства с номера
   select STORAGE in $STORAGE_LIST; do
     if [ -n "$STORAGE" ]; then
       break
@@ -56,14 +51,12 @@ select_storage() {
 # Функция за избор на шаблон
 select_template() {
   echo "Търсене на налични шаблони..."
-  TEMPLATE="debian-11-standard_11.7-1_amd64.tar.zst"  # Стандартен Debian 11 шаблон
+  TEMPLATE="debian-11-standard_11.7-1_amd64.tar.zst"
   
-  # Проверка дали шаблонът е наличен
   if ! pveam list local | grep -q "$TEMPLATE"; then
-    echo "Шаблонът $TEMPLATE не е наличен, опитвам се да го изтегля..."
+    echo "Изтегляне на шаблон $TEMPLATE..."
     pveam download local "$TEMPLATE" || {
-      echo "Грешка при изтегляне на шаблон! Опитайте ръчно:"
-      echo "pveam download local $TEMPLATE"
+      echo "Грешка при изтегляне на шаблон!"
       exit 1
     }
   fi
