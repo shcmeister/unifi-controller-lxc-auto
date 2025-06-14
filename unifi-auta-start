@@ -2,7 +2,7 @@
 
 # ==============================================
 # Скрипт за инсталация на UniFi Controller в LXC
-# Версия: 4.0 (стабилна с timeout проверки)
+# Версия: 4.1 (фикс за pveam команди)
 # ==============================================
 
 # Конфигурация
@@ -16,7 +16,7 @@ CORES=2
 MONGO_VERSION="7.0"
 UNIFI_VERSION="stable"
 TIMEZONE="Europe/Sofia"
-TIMEOUT=30  # Таймаут в секунди за изчакване на операции
+TIMEOUT=300  # Таймаут в секунди
 
 # Цветове
 RED='\033[0;31m'
@@ -60,71 +60,24 @@ check_environment() {
     fi
 }
 
-# Функция за изчакване с timeout
-wait_for() {
-    local command="$1"
-    local description="$2"
-    local timeout=$TIMEOUT
-    local start_time=$(date +%s)
-    
-    log "INFO" "Изчакване: $description (макс $timeout сек)..."
-    
-    while true; do
-        if eval "$command"; then
-            return 0
-        fi
-        
-        if [ $(($(date +%s) - start_time)) -ge $timeout ]; then
-            log "ERROR" "Времето за изчакване изтече ($timeout сек) за: $description"
-            return 1
-        fi
-        
-        sleep 3
-    done
-}
-
 # Ръчен избор на storage
 select_storage() {
     log "INFO" "Списък на наличните storage устройства:"
     echo "----------------------------------------"
     
-    # Използваме pvesm status за да избегнем грешките
-    if ! storage_list=$(pvesm status --enabled 2>/dev/null); then
-        log "ERROR" "Грешка при получаване на списъка със storage устройства!"
-        log "INFO" "Опитвам се с алтернативна команда..."
-        storage_list=$(pvesm list 2>/dev/null)
-    fi
-    
-    echo "$storage_list" | awk '
-        BEGIN {
-            printf "%-20s %-10s %-15s %-10s\n", "Име", "Тип", "Съдържание", "Свободно"
-            printf "-------------------------------------------------\n"
-        }
-        NR>1 {
-            printf "%-20s %-10s %-15s %-10s\n", $1, $2, $3, $4
-        }'
+    # Използваме проста команда за изброяване
+    pvesm list | head -n 10  # Показваме само първите 10 реда за по-голяма яснота
     echo "----------------------------------------"
     
     while true; do
-        read -t 60 -p "Моля, въведете името на storage устройството (или 'exit' за изход): " storage
-        
-        if [ $? -ne 0 ]; then
-            log "ERROR" "Времето за изчакване на вход изтече!"
-            exit 1
-        fi
-        
-        if [ "$storage" = "exit" ]; then
-            log "INFO" "Изход от скрипта по потребителско желание"
-            exit 0
-        fi
-        
+        read -p "Моля, въведете името на storage устройството: " storage
         if [ -z "$storage" ]; then
             log "ERROR" "Не сте въвели storage име!"
             continue
         fi
         
         # Проверка дали storage съществува
-        if echo "$storage_list" | awk '{print $1}' | grep -q "^${storage}$"; then
+        if pvesm list | awk '{print $1}' | grep -q "^${storage}$"; then
             log "INFO" "Избрахте storage: $storage"
             echo "$storage"
             return
@@ -139,10 +92,11 @@ create_container() {
     local storage=$1
     log "INFO" "Подготвяне за създаване на контейнер..."
     
-    if ! pveam list $storage | grep -q "$TEMPLATE"; then
+    # Проверка за шаблона
+    if ! timeout $TIMEOUT pveam list --section templates | grep -q "$TEMPLATE"; then
         log "INFO" "Сваляне на шаблон $TEMPLATE..."
-        if ! timeout $TIMEOUT pveam download $storage $TEMPLATE; then
-            log "ERROR" "Неуспешно сваляне на шаблон или времето изтече!"
+        if ! timeout $TIMEOUT pveam download local "$TEMPLATE"; then
+            log "ERROR" "Неуспешно сваляне на шаблон!"
             exit 1
         fi
     fi
@@ -151,20 +105,20 @@ create_container() {
     log "INFO" "Генерирана root парола: $root_pass"
     
     log "INFO" "Създаване на контейнер $CTID..."
-    if ! timeout $TIMEOUT pct create $CTID "$storage:vztmpl/$TEMPLATE" \
-        --storage $storage \
-        --hostname $HOSTNAME \
+    if ! timeout $TIMEOUT pct create $CTID "local:vztmpl/$TEMPLATE" \
+        --storage "$storage" \
+        --hostname "$HOSTNAME" \
         --memory $MEMORY \
         --swap $SWAP \
         --cores $CORES \
-        --rootfs "$storage:$DISK_SIZE" \
+        --rootfs "${storage}:${DISK_SIZE}" \
         --net0 name=eth0,bridge=vmbr0,ip=dhcp \
         --unprivileged 1 \
         --onboot 1 \
         --password "$root_pass" \
         --features nesting=1 \
-        --timezone $TIMEZONE; then
-        log "ERROR" "Неуспешно създаване на контейнер или времето изтече!"
+        --timezone "$TIMEZONE"; then
+        log "ERROR" "Неуспешно създаване на контейнер!"
         exit 1
     fi
     
@@ -175,18 +129,27 @@ create_container() {
 setup_unifi() {
     log "INFO" "Стартиране на контейнер $CTID..."
     if ! timeout $TIMEOUT pct start $CTID; then
-        log "ERROR" "Неуспешно стартиране на контейнер или времето изтече!"
+        log "ERROR" "Неуспешно стартиране на контейнер!"
         exit 1
     fi
     
     log "INFO" "Изчакване за IP адрес..."
     local ip=""
-    if ! wait_for "pct exec $CTID -- ip -4 -o addr show eth0 2>/dev/null | awk '{print \$4}' | cut -d'/' -f1" "получаване на IP адрес"; then
+    local wait_time=0
+    while [ $wait_time -lt $TIMEOUT ]; do
+        ip=$(pct exec $CTID -- ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d'/' -f1)
+        if [ -n "$ip" ]; then
+            break
+        fi
+        sleep 5
+        wait_time=$((wait_time + 5))
+    done
+    
+    if [ -z "$ip" ]; then
         log "ERROR" "Контейнерът не получи IP адрес!"
         exit 1
     fi
     
-    ip=$(pct exec $CTID -- ip -4 -o addr show eth0 | awk '{print $4}' | cut -d'/' -f1)
     log "SUCCESS" "Контейнерът получи IP: $ip"
     
     log "INFO" "Започва инсталация на UniFi Controller..."
@@ -194,24 +157,49 @@ setup_unifi() {
         set -e
         export DEBIAN_FRONTEND=noninteractive
         
-        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Актуализиране на пакетните списъци..."
-        if ! timeout 300 apt-get update -q; then
-            echo "Грешка при актуализиране на пакетните списъци!"
-            exit 1
-        fi
+        echo "Актуализиране на пакетните списъци..."
+        apt-get update -q
         
-        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Инсталиране на необходими пакети..."
-        if ! timeout 600 apt-get install -yq curl gnupg2 apt-transport-https wget lsb-release ca-certificates ufw; then
-            echo "Грешка при инсталиране на пакети!"
-            exit 1
-        fi
+        echo "Инсталиране на необходими пакети..."
+        apt-get install -yq curl gnupg2 apt-transport-https wget lsb-release ca-certificates ufw
         
-        # Останалата част от инсталацията...
-        # ... (същата като в предишната версия)
+        echo "Добавяне на хранилища..."
+        # MongoDB
+        wget -qO - https://www.mongodb.org/static/pgp/server-'$MONGO_VERSION'.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/mongodb.gpg
+        echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -sc)/mongodb-org/'$MONGO_VERSION' multiverse" > /etc/apt/sources.list.d/mongodb-org.list
         
-        exit 0
+        # UniFi
+        wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | gpg --dearmor > /etc/apt/trusted.gpg.d/unifi-repo.gpg
+        echo "deb [arch=amd64] https://dl.ui.com/unifi/debian '$UNIFI_VERSION' ubiquiti" > /etc/apt/sources.list.d/unifi.list
+        
+        echo "Актуализиране на пакетните списъци..."
+        apt-get update -q
+        
+        echo "Инсталиране на Java..."
+        apt-get install -yq openjdk-17-jre-headless
+        
+        echo "Инсталиране на UniFi Controller..."
+        apt-get install -yq unifi
+        
+        echo "Конфигуриране на защитната стена..."
+        ufw allow 8080/tcp
+        ufw allow 8443/tcp
+        ufw allow 3478/udp
+        ufw allow 10001/udp
+        ufw --force enable
+        
+        echo "Оптимизиране на системата..."
+        echo -e "* soft nofile 8192\n* hard nofile 8192" >> /etc/security/limits.conf
+        
+        echo "Почистване..."
+        apt-get autoremove -yq
+        apt-get clean
+        rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+        
+        echo "Стартиране на UniFi..."
+        systemctl start unifi
     '; then
-        log "ERROR" "Грешка при инсталацията или времето изтече!"
+        log "ERROR" "Грешка при инсталацията!"
         exit 1
     fi
     
