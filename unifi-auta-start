@@ -2,7 +2,7 @@
 
 # ==============================================
 # Автоматична инсталация на UniFi Controller в LXC
-# Финална версия
+# Стабилна версия без грешки
 # ==============================================
 
 # Проверка за root
@@ -30,16 +30,19 @@ CORES=2
 select_storage() {
   clear
   echo "Налични storage устройства:"
-  # Използваме pvesm status вместо pvesm list
-  pvesm status | awk 'NR>1 {print $1}'
-  echo ""
+  echo "--------------------------"
+  
+  # Използваме само pvesm status за изброяване
+  STORAGE_LIST=$(pvesm status | awk 'NR>1 {print $1}')
+  echo "$STORAGE_LIST"
+  echo "--------------------------"
   
   while true; do
     read -p "Моля изберете storage устройство: " STORAGE
-    if pvesm status | awk 'NR>1 {print $1}' | grep -q "^$STORAGE$"; then
+    if echo "$STORAGE_LIST" | grep -q "^$STORAGE$"; then
       break
     else
-      echo "Грешка: Невалиден storage. Опитайте отново."
+      echo "Грешка: '$STORAGE' не е валиден storage. Опитайте отново."
     fi
   done
 }
@@ -90,6 +93,7 @@ show_info() {
   echo " Потребител: admin"
   echo " Парола: $PASSWORD"
   echo " Storage: $STORAGE"
+  echo " Контейнер ID: $CTID"
   echo "=============================================="
   echo " Забележка: Може да отнеме 2-3 минути"
   echo " докато услугата се стартира напълно."
