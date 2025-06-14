@@ -2,7 +2,7 @@
 
 # ==============================================
 # Скрипт за инсталация на UniFi Controller в LXC
-# Версия: 3.2 (поправена синтактична грешка)
+# Версия: 3.3 (поправена синтактична грешка)
 # ==============================================
 
 # --- Конфигурация ---
@@ -30,12 +30,22 @@ log() {
     local message=$2
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     
-    case "$level" in
-        "INFO") echo -e "${BLUE}[${timestamp}] INFO: ${message}${NC}" ;;
-        "WARN") echo -e "${YELLOW}[${timestamp}] WARN: ${message}${NC}" ;;
-        "ERROR") echo -e "${RED}[${timestamp}] ERROR: ${message}${NC}" ;;
-        "SUCCESS") echo -e "${GREEN}[${timestamp}] SUCCESS: ${message}${NC}" ;;
-        *) echo -e "[${timestamp}] ${message}" ;;
+    case "${level}" in
+        "INFO")
+            echo -e "${BLUE}[${timestamp}] INFO: ${message}${NC}"
+            ;;
+        "WARN")
+            echo -e "${YELLOW}[${timestamp}] WARN: ${message}${NC}"
+            ;;
+        "ERROR")
+            echo -e "${RED}[${timestamp}] ERROR: ${message}${NC}"
+            ;;
+        "SUCCESS")
+            echo -e "${GREEN}[${timestamp}] SUCCESS: ${message}${NC}"
+            ;;
+        *)
+            echo -e "[${timestamp}] ${message}"
+            ;;
     esac
 }
 
@@ -93,8 +103,8 @@ create_container() {
     if ! pveam list $storage | grep -q "$TEMPLATE"; then
         log "INFO" "Сваляне на шаблон $TEMPLATE..."
         pveam download $storage $TEMPLATE || {
-            log "ERROR" "Неуспешно сваляне на шаблон!";
-            exit 1;
+            log "ERROR" "Неуспешно сваляне на шаблон!"
+            exit 1
         }
     fi
 
@@ -115,8 +125,8 @@ create_container() {
         --password "$root_pass" \
         --features nesting=1 \
         --timezone $TIMEZONE || {
-            log "ERROR" "Неуспешно създаване на контейнер!";
-            exit 1;
+            log "ERROR" "Неуспешно създаване на контейнер!"
+            exit 1
         }
     
     log "SUCCESS" "Контейнерът е създаден успешно!"
@@ -126,8 +136,8 @@ create_container() {
 setup_unifi() {
     log "INFO" "Стартиране на контейнер $CTID..."
     pct start $CTID || {
-        log "ERROR" "Неуспешно стартиране на контейнер!";
-        exit 1;
+        log "ERROR" "Неуспешно стартиране на контейнер!"
+        exit 1
     }
     
     log "INFO" "Изчакване за IP адрес..."
@@ -192,8 +202,8 @@ setup_unifi() {
         echo "[$(date "+%Y-%m-%d %H:%M:%S")] Стартиране на UniFi..."
         systemctl start unifi
     ' || {
-        log "ERROR" "Грешка при инсталацията!";
-        exit 1;
+        log "ERROR" "Грешка при инсталацията!"
+        exit 1
     }
     
     log "SUCCESS" "Инсталацията завърши успешно!"
