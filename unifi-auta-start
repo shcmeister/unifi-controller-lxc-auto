@@ -1,29 +1,28 @@
 #!/bin/bash
 
 # ==============================================
-# Скрипт за автоматична инсталация на UniFi Controller
-# в LXC контейнер на Proxmox VE
-# Версия: 3.0
+# Скрипт за инсталация на UniFi Controller в LXC
+# Версия: 3.1 (ръчен избор на storage)
 # ==============================================
 
 # --- Конфигурация ---
-CTID=$(pvesh get /cluster/nextid)       # Автоматично генериране на ID
-HOSTNAME="unifi-${CTID}"               # Име на контейнера
-TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"  # Шаблон за Debian 12
-MEMORY=2048                            # Памет в MB (2GB)
-SWAP=512                               # Swap пространство в MB
-DISK_SIZE="10G"                        # Размер на диска
-CORES=2                                # Брой CPU ядра
-MONGO_VERSION="7.0"                    # Версия на MongoDB
-UNIFI_VERSION="stable"                 # Версия на UniFi (stable/rc)
-TIMEZONE="Europe/Sofia"                # Времева зона
+CTID=$(pvesh get /cluster/nextid)
+HOSTNAME="unifi-${CTID}"
+TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+MEMORY=2048
+SWAP=512
+DISK_SIZE="10G"
+CORES=2
+MONGO_VERSION="7.0"
+UNIFI_VERSION="stable"
+TIMEZONE="Europe/Sofia"
 
-# --- Цветове за output ---
+# --- Цветове ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # --- Функция за логване ---
 log() {
@@ -36,7 +35,6 @@ log() {
         "WARN") echo -e "${YELLOW}[${timestamp}] WARN: ${message}${NC}" ;;
         "ERROR") echo -e "${RED}[${timestamp}] ERROR: ${message}${NC}" ;;
         "SUCCESS") echo -e "${GREEN}[${timestamp}] SUCCESS: ${message}${NC}" ;;
-        *) echo -e "[${timestamp}] ${message}" ;;
     esac
 }
 
@@ -50,7 +48,7 @@ check_environment() {
     fi
     
     if ! command -v pct &> /dev/null; then
-        log "ERROR" "Командата 'pct' не е намерена. Този скрипт е предназначен за Proxmox VE!"
+        log "ERROR" "Командата 'pct' не е намерена. Този скрипт е за Proxmox VE!"
         exit 1
     fi
     
@@ -60,68 +58,33 @@ check_environment() {
     fi
 }
 
-# --- Намиране на най-добрия storage ---
-find_best_storage() {
-    log "INFO" "Анализ на storage устройствата..."
-    
-    # Първо проверяваме кои storage-и поддържат създаване на контейнери
-    local supported_storages=$(pvesm status --enabled --type dir,lvmthin,zfspool 2>/dev/null | awk '
+# --- Ръчен избор на storage ---
+select_storage() {
+    log "INFO" "Списък на наличните storage устройства:"
+    echo "----------------------------------------"
+    pvesm status --enabled --type dir,lvmthin,zfspool | awk '
         BEGIN {
-            name_col = 0;
-            avail_col = 0;
-            type_col = 0;
-            content_col = 0;
+            printf "%-20s %-10s %-10s %-10s\n", "Име", "Тип", "Свободно", "Съдържание"
+            printf "-------------------------------------------------\n"
         }
-        NR==1 {
-            for (i=1; i<=NF; i++) {
-                if ($i == "Storage") name_col = i;
-                if ($i == "Avail") avail_col = i;
-                if ($i == "Type") type_col = i;
-                if ($i == "Content") content_col = i;
-            }
-            next;
-        }
-        {
-            storage = $name_col;
-            type = $type_col;
-            content = $content_col;
-            avail = $avail_col;
-            
-            # Проверка дали поддържа контейнери
-            if (content ~ /rootdir/) {
-                # Конвертиране на свободното пространство в мегабайти
-                if (avail ~ /T$/) { size = avail * 1024 * 1024; }
-                else if (avail ~ /G$/) { size = avail * 1024; }
-                else if (avail ~ /M$/) { size = avail; }
-                else { size = 0; }
-                
-                if (size > 0) {
-                    print storage, type, size;
-                }
-            }
-        }
-    ' | sort -k3 -nr)
+        NR>1 {
+            printf "%-20s %-10s %-10s %-10s\n", $1, $2, $3, $4
+        }'
+    echo "----------------------------------------"
     
-    if [ -z "$supported_storages" ]; then
-        log "ERROR" "Не са намерени подходящи storage устройства!"
-        log "ERROR" "Моля, проверете дали имате поне един storage от тип:"
-        log "ERROR" " - dir (директория)"
-        log "ERROR" " - lvmthin (LVM thin pool)"
-        log "ERROR" " - zfspool (ZFS pool)"
-        log "ERROR" "който поддържа създаване на контейнери и има достатъчно свободно място."
-        exit 1
-    fi
-    
-    # Избираме първия storage (с най-много свободно място)
-    local best_storage=$(echo "$supported_storages" | head -n1 | awk '{print $1}')
-    local best_storage_type=$(echo "$supported_storages" | head -n1 | awk '{print $2}')
-    local best_storage_size=$(echo "$supported_storages" | head -n1 | awk '{print $3}')
-    
-    log "INFO" "Намерен storage: $best_storage (Тип: $best_storage_type, Свободно: $best_storage_size MB)"
-    echo "$best_storage"
+    while true; do
+        read -p "Моля, въведете името на storage устройството, където искате да инсталирате контейнера: " storage
+        if pvesm list | grep -q "^${storage}\s"; then
+            log "INFO" "Избрахте storage: $storage"
+            echo "$storage"
+            break
+        else
+            log "ERROR" "Невалиден избор! Моля, опитайте отново."
+        fi
+    done
 }
 
-# --- Създаване на LXC контейнер ---
+# --- Създаване на контейнер ---
 create_container() {
     local storage=$1
     log "INFO" "Подготвяне за създаване на контейнер..."
@@ -161,8 +124,8 @@ create_container() {
     log "SUCCESS" "Контейнерът е създаден успешно!"
 }
 
-# --- Стартиране и конфигуриране на контейнера ---
-setup_container() {
+# --- Инсталация на UniFi ---
+setup_unifi() {
     log "INFO" "Стартиране на контейнер $CTID..."
     pct start $CTID || {
         log "ERROR" "Неуспешно стартиране на контейнер!";
@@ -185,24 +148,19 @@ setup_container() {
     
     log "SUCCESS" "Контейнерът получи IP: $ip"
     
-    # Инсталация на UniFi Controller
+    # Инсталация на UniFi
     log "INFO" "Започва инсталация на UniFi Controller..."
     pct exec $CTID -- bash -c '
         set -e
+        export DEBIAN_FRONTEND=noninteractive
         
-        # Функция за логване вътре в контейнера
-        log() {
-            echo "[$(date "+%Y-%m-%d %H:%M:%S")] $1"
-        }
-        
-        log "Актуализиране на пакетните списъци..."
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Актуализиране на пакетните списъци..."
         apt-get update -q
         
-        log "Инсталиране на необходими пакети..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -yq \
-            curl gnupg2 apt-transport-https wget lsb-release ca-certificates ufw
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Инсталиране на необходими пакети..."
+        apt-get install -yq curl gnupg2 apt-transport-https wget lsb-release ca-certificates ufw
         
-        log "Добавяне на хранилища..."
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Добавяне на хранилища..."
         # MongoDB
         wget -qO - https://www.mongodb.org/static/pgp/server-'$MONGO_VERSION'.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/mongodb.gpg
         echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -sc)/mongodb-org/'$MONGO_VERSION' multiverse" > /etc/apt/sources.list.d/mongodb-org.list
@@ -211,39 +169,34 @@ setup_container() {
         wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | gpg --dearmor > /etc/apt/trusted.gpg.d/unifi-repo.gpg
         echo "deb [arch=amd64] https://dl.ui.com/unifi/debian '$UNIFI_VERSION' ubiquiti" > /etc/apt/sources.list.d/unifi.list
         
-        log "Актуализиране на пакетните списъци..."
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Актуализиране на пакетните списъци..."
         apt-get update -q
         
-        log "Инсталиране на Java..."
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Инсталиране на Java..."
         apt-get install -yq openjdk-17-jre-headless
         
-        log "Инсталиране на UniFi Controller..."
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Инсталиране на UniFi Controller..."
         apt-get install -yq unifi
         
-        log "Конфигуриране на защитната стена..."
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Конфигуриране на защитната стена..."
         ufw allow 8080/tcp    # Управление на устройства
         ufw allow 8443/tcp    # Управляващ интерфейс
         ufw allow 3478/udp    # STUN
         ufw allow 10001/udp   # AP discovery
         ufw --force enable
         
-        log "Оптимизиране на системата..."
-        systemctl stop unifi
-        echo -e "\
-* soft nofile 8192\n\
-* hard nofile 8192\n\
-* soft nproc 8192\n\
-* hard nproc 8192" >> /etc/security/limits.conf
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Оптимизиране на системата..."
+        echo -e "* soft nofile 8192\n* hard nofile 8192" >> /etc/security/limits.conf
         
-        log "Почистване на системата..."
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Почистване..."
         apt-get autoremove -yq
         apt-get clean
         rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
         
-        log "Стартиране на услугата UniFi..."
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] Стартиране на UniFi..."
         systemctl start unifi
     ' || {
-        log "ERROR" "Грешка при инсталацията в контейнера!";
+        log "ERROR" "Грешка при инсталацията!";
         exit 1;
     }
     
@@ -255,17 +208,14 @@ main() {
     clear
     echo -e "${GREEN}"
     echo "=============================================="
-    echo " Автоматична инсталация на UniFi Controller"
-    echo " в LXC контейнер на Proxmox VE"
+    echo " Инсталация на UniFi Controller в LXC"
     echo "=============================================="
     echo -e "${NC}"
     
     check_environment
-    
-    local storage=$(find_best_storage)
-    
+    storage=$(select_storage)
     create_container "$storage"
-    setup_container
+    setup_unifi
     
     local ip=$(pct exec $CTID ip -4 -o addr show eth0 | awk '{print $4}' | cut -d'/' -f1)
     local root_pass=$(pct config $CTID | grep '^rootfs' | awk -F'password=' '{print $2}' | cut -d',' -f1)
@@ -276,10 +226,10 @@ main() {
     echo "=============================================="
     echo -e "${NC}"
     echo -e " ${BLUE}●${NC} Контейнер ID: ${YELLOW}$CTID${NC}"
-    echo -e " ${BLUE}●${NC} Име на контейнер: ${YELLOW}$HOSTNAME${NC}"
+    echo -e " ${BLUE}●${NC} Име: ${YELLOW}$HOSTNAME${NC}"
     echo -e " ${BLUE}●${NC} Storage: ${YELLOW}$storage${NC}"
     echo -e " ${BLUE}●${NC} IP адрес: ${YELLOW}$ip${NC}"
-    echo -e " ${BLUE}●${NC} UniFi интерфейс: ${YELLOW}https://$ip:8443${NC}"
+    echo -e " ${BLUE}●${NC} Уеб интерфейс: ${YELLOW}https://$ip:8443${NC}"
     echo -e " ${BLUE}●${NC} Root парола: ${YELLOW}$root_pass${NC}"
     echo -e "${GREEN}"
     echo " Забележка: Може да отнеме 2-3 минути, докато"
@@ -288,5 +238,4 @@ main() {
     echo -e "${NC}"
 }
 
-# Стартиране на главната функция
 main
