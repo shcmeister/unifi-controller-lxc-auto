@@ -2,10 +2,10 @@
 
 # ==============================================
 # Скрипт за инсталация на UniFi Controller в LXC
-# Версия: 3.3 (поправена синтактична грешка)
+# Версия: 3.5 (фикс за pvesm команди)
 # ==============================================
 
-# --- Конфигурация ---
+# Конфигурация
 CTID=$(pvesh get /cluster/nextid)
 HOSTNAME="unifi-${CTID}"
 TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
@@ -17,39 +17,29 @@ MONGO_VERSION="7.0"
 UNIFI_VERSION="stable"
 TIMEZONE="Europe/Sofia"
 
-# --- Цветове ---
+# Цветове
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# --- Функция за логване ---
+# Функция за логване
 log() {
     local level=$1
     local message=$2
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     
     case "${level}" in
-        "INFO")
-            echo -e "${BLUE}[${timestamp}] INFO: ${message}${NC}"
-            ;;
-        "WARN")
-            echo -e "${YELLOW}[${timestamp}] WARN: ${message}${NC}"
-            ;;
-        "ERROR")
-            echo -e "${RED}[${timestamp}] ERROR: ${message}${NC}"
-            ;;
-        "SUCCESS")
-            echo -e "${GREEN}[${timestamp}] SUCCESS: ${message}${NC}"
-            ;;
-        *)
-            echo -e "[${timestamp}] ${message}"
-            ;;
+        "INFO") echo -e "${BLUE}[${timestamp}] INFO: ${message}${NC}" ;;
+        "WARN") echo -e "${YELLOW}[${timestamp}] WARN: ${message}${NC}" ;;
+        "ERROR") echo -e "${RED}[${timestamp}] ERROR: ${message}${NC}" ;;
+        "SUCCESS") echo -e "${GREEN}[${timestamp}] SUCCESS: ${message}${NC}" ;;
+        *) echo -e "[${timestamp}] ${message}" ;;
     esac
 }
 
-# --- Проверка на средата ---
+# Проверка на средата
 check_environment() {
     log "INFO" "Проверка на средата..."
     
@@ -69,17 +59,19 @@ check_environment() {
     fi
 }
 
-# --- Ръчен избор на storage ---
+# Ръчен избор на storage
 select_storage() {
     log "INFO" "Списък на наличните storage устройства:"
     echo "----------------------------------------"
-    pvesm status --enabled --type dir,lvmthin,zfspool | awk '
+    
+    # Използваме правилната команда за изброяване на storage
+    pvesm list -o storage,type,content,avail | awk '
         BEGIN {
-            printf "%-20s %-10s %-10s %-10s\n", "Име", "Тип", "Свободно", "Съдържание"
+            printf "%-20s %-10s %-15s %-10s\n", "Име", "Тип", "Съдържание", "Свободно"
             printf "-------------------------------------------------\n"
         }
         NR>1 {
-            printf "%-20s %-10s %-10s %-10s\n", $1, $2, $3, $4
+            printf "%-20s %-10s %-15s %-10s\n", $1, $2, $3, $4
         }'
     echo "----------------------------------------"
     
@@ -95,7 +87,7 @@ select_storage() {
     done
 }
 
-# --- Създаване на контейнер ---
+# Създаване на контейнер
 create_container() {
     local storage=$1
     log "INFO" "Подготвяне за създаване на контейнер..."
@@ -132,7 +124,7 @@ create_container() {
     log "SUCCESS" "Контейнерът е създаден успешно!"
 }
 
-# --- Инсталация на UniFi ---
+# Инсталация на UniFi
 setup_unifi() {
     log "INFO" "Стартиране на контейнер $CTID..."
     pct start $CTID || {
@@ -209,7 +201,7 @@ setup_unifi() {
     log "SUCCESS" "Инсталацията завърши успешно!"
 }
 
-# --- Главна функция ---
+# Главна функция
 main() {
     clear
     echo -e "${GREEN}"
