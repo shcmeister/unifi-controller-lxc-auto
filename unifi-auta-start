@@ -2,7 +2,7 @@
 
 # ==============================================
 # Скрипт за инсталация на UniFi Controller в LXC
-# Версия: 3.7 (финална работна версия)
+# Версия: 3.9 (ръчен избор на storage)
 # ==============================================
 
 # Конфигурация
@@ -64,8 +64,8 @@ select_storage() {
     log "INFO" "Списък на наличните storage устройства:"
     echo "----------------------------------------"
     
-    # Използваме правилната команда за изброяване на storage
-    pvesm list | awk '
+    # Използваме pvesm status за да избегнем грешките с pvesm list
+    pvesm status | awk '
         BEGIN {
             printf "%-20s %-10s %-15s %-10s\n", "Име", "Тип", "Съдържание", "Свободно"
             printf "-------------------------------------------------\n"
@@ -83,7 +83,7 @@ select_storage() {
         fi
         
         # Проверка дали storage съществува
-        if pvesm list | awk '{print $1}' | grep -q "^${storage}$"; then
+        if pvesm status | awk '{print $1}' | grep -q "^${storage}$"; then
             log "INFO" "Избрахте storage: $storage"
             echo "$storage"
             break
