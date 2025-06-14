@@ -1,243 +1,105 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ==============================================
-# Скрипт за инсталация на UniFi Controller в LXC
-# Версия: 4.1 (фикс за pveam команди)
+# Автоматична инсталация на UniFi Controller в LXC
+# Адаптация на скрипта от tteck/Proxmox
 # ==============================================
+
+# Проверка за root
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Този скрипт трябва да се изпълнява като root!"
+  exit 1
+fi
+
+# Проверка за Proxmox VE
+if ! command -v pct >/dev/null 2>&1; then
+  echo "Този скрипт е предназначен за Proxmox VE!"
+  exit 1
+fi
 
 # Конфигурация
 CTID=$(pvesh get /cluster/nextid)
-HOSTNAME="unifi-${CTID}"
-TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+HOSTNAME="unifi"
+PASSWORD=$(openssl rand -base64 12)
 MEMORY=2048
 SWAP=512
-DISK_SIZE="10G"
+DISK_SIZE="8G"
 CORES=2
-MONGO_VERSION="7.0"
-UNIFI_VERSION="stable"
-TIMEZONE="Europe/Sofia"
-TIMEOUT=300  # Таймаут в секунди
 
-# Цветове
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-# Функция за логване
-log() {
-    local level=$1
-    local message=$2
-    local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    
-    case "${level}" in
-        "INFO") echo -e "${BLUE}[${timestamp}] INFO: ${message}${NC}" ;;
-        "WARN") echo -e "${YELLOW}[${timestamp}] WARN: ${message}${NC}" ;;
-        "ERROR") echo -e "${RED}[${timestamp}] ERROR: ${message}${NC}" ;;
-        "SUCCESS") echo -e "${GREEN}[${timestamp}] SUCCESS: ${message}${NC}" ;;
-        *) echo -e "[${timestamp}] ${message}" ;;
-    esac
-}
-
-# Проверка на средата
-check_environment() {
-    log "INFO" "Проверка на средата..."
-    
-    if [[ $EUID -ne 0 ]]; then
-        log "ERROR" "Този скрипт трябва да се изпълнява като root!"
-        exit 1
-    fi
-    
-    if ! command -v pct &> /dev/null; then
-        log "ERROR" "Командата 'pct' не е намерена. Този скрипт е за Proxmox VE!"
-        exit 1
-    fi
-    
-    if pct status $CTID &> /dev/null; then
-        log "ERROR" "Контейнер с ID $CTID вече съществува!"
-        exit 1
-    fi
-}
-
-# Ръчен избор на storage
+# Функция за избор на storage
 select_storage() {
-    log "INFO" "Списък на наличните storage устройства:"
-    echo "----------------------------------------"
-    
-    # Използваме проста команда за изброяване
-    pvesm list | head -n 10  # Показваме само първите 10 реда за по-голяма яснота
-    echo "----------------------------------------"
-    
-    while true; do
-        read -p "Моля, въведете името на storage устройството: " storage
-        if [ -z "$storage" ]; then
-            log "ERROR" "Не сте въвели storage име!"
-            continue
-        fi
-        
-        # Проверка дали storage съществува
-        if pvesm list | awk '{print $1}' | grep -q "^${storage}$"; then
-            log "INFO" "Избрахте storage: $storage"
-            echo "$storage"
-            return
-        else
-            log "ERROR" "Невалиден избор! Моля, опитайте отново."
-        fi
-    done
+  clear
+  echo "Налични storage устройства:"
+  pvesm status | awk 'NR>1 {print $1}'
+  echo ""
+  
+  while true; do
+    read -p "Моля изберете storage устройство: " STORAGE
+    if pvesm list | grep -q "^$STORAGE "; then
+      break
+    else
+      echo "Грешка: Невалиден storage. Опитайте отново."
+    fi
+  done
 }
 
 # Създаване на контейнер
 create_container() {
-    local storage=$1
-    log "INFO" "Подготвяне за създаване на контейнер..."
-    
-    # Проверка за шаблона
-    if ! timeout $TIMEOUT pveam list --section templates | grep -q "$TEMPLATE"; then
-        log "INFO" "Сваляне на шаблон $TEMPLATE..."
-        if ! timeout $TIMEOUT pveam download local "$TEMPLATE"; then
-            log "ERROR" "Неуспешно сваляне на шаблон!"
-            exit 1
-        fi
-    fi
+  echo "Създаване на LXC контейнер..."
+  pct create $CTID \
+    -storage $STORAGE \
+    -hostname $HOSTNAME \
+    -password "$PASSWORD" \
+    -memory $MEMORY \
+    -swap $SWAP \
+    -cores $CORES \
+    -net0 name=eth0,bridge=vmbr0,ip=dhcp \
+    -unprivileged 1 \
+    -features nesting=1 \
+    -ostype debian \
+    -rootfs $STORAGE:$DISK_SIZE
 
-    local root_pass=$(openssl rand -base64 12)
-    log "INFO" "Генерирана root парола: $root_pass"
-    
-    log "INFO" "Създаване на контейнер $CTID..."
-    if ! timeout $TIMEOUT pct create $CTID "local:vztmpl/$TEMPLATE" \
-        --storage "$storage" \
-        --hostname "$HOSTNAME" \
-        --memory $MEMORY \
-        --swap $SWAP \
-        --cores $CORES \
-        --rootfs "${storage}:${DISK_SIZE}" \
-        --net0 name=eth0,bridge=vmbr0,ip=dhcp \
-        --unprivileged 1 \
-        --onboot 1 \
-        --password "$root_pass" \
-        --features nesting=1 \
-        --timezone "$TIMEZONE"; then
-        log "ERROR" "Неуспешно създаване на контейнер!"
-        exit 1
-    fi
-    
-    log "SUCCESS" "Контейнерът е създаден успешно!"
+  pct start $CTID
+  sleep 5
 }
 
 # Инсталация на UniFi
-setup_unifi() {
-    log "INFO" "Стартиране на контейнер $CTID..."
-    if ! timeout $TIMEOUT pct start $CTID; then
-        log "ERROR" "Неуспешно стартиране на контейнер!"
-        exit 1
-    fi
-    
-    log "INFO" "Изчакване за IP адрес..."
-    local ip=""
-    local wait_time=0
-    while [ $wait_time -lt $TIMEOUT ]; do
-        ip=$(pct exec $CTID -- ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d'/' -f1)
-        if [ -n "$ip" ]; then
-            break
-        fi
-        sleep 5
-        wait_time=$((wait_time + 5))
-    done
-    
-    if [ -z "$ip" ]; then
-        log "ERROR" "Контейнерът не получи IP адрес!"
-        exit 1
-    fi
-    
-    log "SUCCESS" "Контейнерът получи IP: $ip"
-    
-    log "INFO" "Започва инсталация на UniFi Controller..."
-    if ! timeout $((TIMEOUT * 2)) pct exec $CTID -- bash -c '
-        set -e
-        export DEBIAN_FRONTEND=noninteractive
-        
-        echo "Актуализиране на пакетните списъци..."
-        apt-get update -q
-        
-        echo "Инсталиране на необходими пакети..."
-        apt-get install -yq curl gnupg2 apt-transport-https wget lsb-release ca-certificates ufw
-        
-        echo "Добавяне на хранилища..."
-        # MongoDB
-        wget -qO - https://www.mongodb.org/static/pgp/server-'$MONGO_VERSION'.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/mongodb.gpg
-        echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -sc)/mongodb-org/'$MONGO_VERSION' multiverse" > /etc/apt/sources.list.d/mongodb-org.list
-        
-        # UniFi
-        wget -qO - https://dl.ui.com/unifi/unifi-repo.gpg | gpg --dearmor > /etc/apt/trusted.gpg.d/unifi-repo.gpg
-        echo "deb [arch=amd64] https://dl.ui.com/unifi/debian '$UNIFI_VERSION' ubiquiti" > /etc/apt/sources.list.d/unifi.list
-        
-        echo "Актуализиране на пакетните списъци..."
-        apt-get update -q
-        
-        echo "Инсталиране на Java..."
-        apt-get install -yq openjdk-17-jre-headless
-        
-        echo "Инсталиране на UniFi Controller..."
-        apt-get install -yq unifi
-        
-        echo "Конфигуриране на защитната стена..."
-        ufw allow 8080/tcp
-        ufw allow 8443/tcp
-        ufw allow 3478/udp
-        ufw allow 10001/udp
-        ufw --force enable
-        
-        echo "Оптимизиране на системата..."
-        echo -e "* soft nofile 8192\n* hard nofile 8192" >> /etc/security/limits.conf
-        
-        echo "Почистване..."
-        apt-get autoremove -yq
-        apt-get clean
-        rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-        
-        echo "Стартиране на UniFi..."
-        systemctl start unifi
-    '; then
-        log "ERROR" "Грешка при инсталацията!"
-        exit 1
-    fi
-    
-    log "SUCCESS" "Инсталацията завърши успешно!"
+install_unifi() {
+  echo "Инсталиране на UniFi Controller..."
+  pct exec $CTID -- bash -c '
+    apt-get update && apt-get install -y wget
+    wget -qO - https://www.mongodb.org/static/pgp/server-4.4.asc | apt-key add -
+    echo "deb http://repo.mongodb.org/apt/debian buster/mongodb-org/4.4 main" > /etc/apt/sources.list.d/mongodb-org.list
+    wget -qO - https://www.ui.com/downloads/unifi/debian/unifi-repo.gpg | apt-key add -
+    echo "deb https://www.ui.com/downloads/unifi/debian stable ubiquiti" > /etc/apt/sources.list.d/100-unifi.list
+    apt-get update && apt-get install -y openjdk-8-jre-headless unifi
+    systemctl start unifi
+  '
+}
+
+# Показване на информация
+show_info() {
+  clear
+  IP=$(pct exec $CTID ip -4 -o addr show eth0 | awk '{print $4}' | cut -d'/' -f1)
+  
+  echo "=============================================="
+  echo " Инсталацията завърши успешно!"
+  echo "=============================================="
+  echo " UniFi Controller: https://$IP:8443"
+  echo " Потребител: admin"
+  echo " Парола: $PASSWORD"
+  echo "=============================================="
+  echo " Забележка: Може да отнеме 2-3 минути"
+  echo " докато услугата се стартира напълно."
+  echo "=============================================="
 }
 
 # Главна функция
 main() {
-    clear
-    echo -e "${GREEN}"
-    echo "=============================================="
-    echo " Инсталация на UniFi Controller в LXC"
-    echo "=============================================="
-    echo -e "${NC}"
-    
-    check_environment
-    storage=$(select_storage)
-    create_container "$storage"
-    setup_unifi
-    
-    local ip=$(pct exec $CTID -- ip -4 -o addr show eth0 | awk '{print $4}' | cut -d'/' -f1)
-    local root_pass=$(pct config $CTID | grep '^rootfs' | awk -F'password=' '{print $2}' | cut -d',' -f1)
-    
-    echo -e "${GREEN}"
-    echo "=============================================="
-    echo " ИНСТАЛАЦИЯТА ЗАВЪРШИ УСПЕШНО!"
-    echo "=============================================="
-    echo -e "${NC}"
-    echo -e " ${BLUE}●${NC} Контейнер ID: ${YELLOW}$CTID${NC}"
-    echo -e " ${BLUE}●${NC} Име: ${YELLOW}$HOSTNAME${NC}"
-    echo -e " ${BLUE}●${NC} Storage: ${YELLOW}$storage${NC}"
-    echo -e " ${BLUE}●${NC} IP адрес: ${YELLOW}$ip${NC}"
-    echo -e " ${BLUE}●${NC} Уеб интерфейс: ${YELLOW}https://$ip:8443${NC}"
-    echo -e " ${BLUE}●${NC} Root парола: ${YELLOW}$root_pass${NC}"
-    echo -e "${GREEN}"
-    echo " Забележка: Може да отнеме 2-3 минути за инициализация"
-    echo "=============================================="
-    echo -e "${NC}"
+  select_storage
+  create_container
+  install_unifi
+  show_info
 }
 
 main
