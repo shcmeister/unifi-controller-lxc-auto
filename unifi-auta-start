@@ -2,7 +2,7 @@
 
 # ==============================================
 # Автоматична инсталация на UniFi Controller в LXC
-# Финална работна версия
+# Коригирана версия
 # ==============================================
 
 # Проверка за root
@@ -32,41 +32,72 @@ select_storage() {
   echo "Налични storage устройства:"
   echo "--------------------------"
   
-  # Надежден метод за получаване на storage списък
-  STORAGE_LIST=$(grep -Po '^\w+(?=\s+)' /etc/pve/storage.cfg 2>/dev/null | sort | uniq)
+  # Подобрен метод за получаване на storage списък
+  STORAGE_LIST=$(pvesm status --enabled --type dir,lvmthin | awk 'NR>1 {print $1}')
   if [ -z "$STORAGE_LIST" ]; then
     echo "Грешка: Не мога да получа списък със storage устройства!"
+    echo "Проверете дали имате конфигурирани storage устройства в Proxmox."
     exit 1
   fi
   
   echo "$STORAGE_LIST"
   echo "--------------------------"
   
-  while true; do
-    read -p "Моля изберете storage устройство: " STORAGE
-    if echo "$STORAGE_LIST" | grep -q "^$STORAGE$"; then
+  PS3="Моля изберете storage устройство: "
+  select STORAGE in $STORAGE_LIST; do
+    if [ -n "$STORAGE" ]; then
       break
     else
-      echo "Грешка: '$STORAGE' не е валиден storage. Опитайте отново."
+      echo "Грешен избор. Опитайте отново."
     fi
   done
 }
 
+# Функция за избор на шаблон
+select_template() {
+  echo "Търсене на налични шаблони..."
+  TEMPLATES=$(pveam available --section system | grep debian | head -5)
+  
+  if [ -z "$TEMPLATES" ]; then
+    echo "Грешка: Не са намерени Debian шаблони!"
+    echo "Моля, изтеглете шаблон от GUI или с команда: pveam download local"
+    exit 1
+  fi
+  
+  echo "Налични шаблони:"
+  echo "$TEMPLATES"
+  
+  # Взимаме първия намерен Debian шаблон
+  TEMPLATE=$(echo "$TEMPLATES" | awk '{print $2}' | head -1)
+  echo "Използва се шаблон: $TEMPLATE"
+  
+  # Проверяваме дали шаблонът е изтеглен
+  if ! pveam list local | grep -q "$TEMPLATE"; then
+    echo "Изтегляне на шаблон $TEMPLATE..."
+    pveam download local "$TEMPLATE" || {
+      echo "Грешка при изтегляне на шаблон!"
+      exit 1
+    }
+  fi
+}
+
 # Създаване на контейнер
 create_container() {
+  select_template
+  
   echo "Създаване на LXC контейнер..."
   if ! pct create $CTID \
-    -storage "$STORAGE" \
-    -hostname "$HOSTNAME" \
-    -password "$PASSWORD" \
-    -memory $MEMORY \
-    -swap $SWAP \
-    -cores $CORES \
-    -net0 name=eth0,bridge=vmbr0,ip=dhcp \
-    -unprivileged 1 \
-    -features nesting=1 \
-    -ostype debian \
-    -rootfs "$STORAGE:$DISK_SIZE"; then
+    "local:vztmpl/$TEMPLATE" \
+    --storage "$STORAGE" \
+    --hostname "$HOSTNAME" \
+    --password "$PASSWORD" \
+    --memory $MEMORY \
+    --swap $SWAP \
+    --cores $CORES \
+    --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+    --unprivileged 1 \
+    --features nesting=1 \
+    --rootfs "$STORAGE:$DISK_SIZE"; then
     echo "Грешка при създаване на контейнер!"
     exit 1
   fi
@@ -80,7 +111,7 @@ create_container() {
 install_unifi() {
   echo "Инсталиране на UniFi Controller..."
   pct exec $CTID -- bash -c '
-    apt-get update && apt-get install -y wget
+    apt-get update && apt-get install -y wget gnupg2
     wget -qO - https://www.mongodb.org/static/pgp/server-4.4.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-archive-keyring.gpg
     echo "deb [signed-by=/usr/share/keyrings/mongodb-archive-keyring.gpg] http://repo.mongodb.org/apt/debian buster/mongodb-org/4.4 main" > /etc/apt/sources.list.d/mongodb-org.list
     wget -qO - https://www.ui.com/downloads/unifi/debian/unifi-repo.gpg | gpg --dearmor -o /usr/share/keyrings/unifi-repo.gpg
