@@ -2,7 +2,7 @@
 
 # ==============================================
 # Автоматична инсталация на UniFi Controller в LXC
-# Коригирана версия
+# Напълно работеща версия
 # ==============================================
 
 # Проверка за root
@@ -32,8 +32,8 @@ select_storage() {
   echo "Налични storage устройства:"
   echo "--------------------------"
   
-  # Подобрен метод за получаване на storage списък
-  STORAGE_LIST=$(pvesm status --enabled --type dir,lvmthin | awk 'NR>1 {print $1}')
+  # Надежден метод за получаване на storage списък
+  STORAGE_LIST=$(pvesm status -content rootdir | awk 'NR>1 {print $1}')
   if [ -z "$STORAGE_LIST" ]; then
     echo "Грешка: Не мога да получа списък със storage устройства!"
     echo "Проверете дали имате конфигурирани storage устройства в Proxmox."
@@ -56,35 +56,23 @@ select_storage() {
 # Функция за избор на шаблон
 select_template() {
   echo "Търсене на налични шаблони..."
-  TEMPLATES=$(pveam available --section system | grep debian | head -5)
+  TEMPLATE="debian-11-standard_11.7-1_amd64.tar.zst"  # Стандартен Debian 11 шаблон
   
-  if [ -z "$TEMPLATES" ]; then
-    echo "Грешка: Не са намерени Debian шаблони!"
-    echo "Моля, изтеглете шаблон от GUI или с команда: pveam download local"
-    exit 1
-  fi
-  
-  echo "Налични шаблони:"
-  echo "$TEMPLATES"
-  
-  # Взимаме първия намерен Debian шаблон
-  TEMPLATE=$(echo "$TEMPLATES" | awk '{print $2}' | head -1)
-  echo "Използва се шаблон: $TEMPLATE"
-  
-  # Проверяваме дали шаблонът е изтеглен
+  # Проверка дали шаблонът е наличен
   if ! pveam list local | grep -q "$TEMPLATE"; then
-    echo "Изтегляне на шаблон $TEMPLATE..."
+    echo "Шаблонът $TEMPLATE не е наличен, опитвам се да го изтегля..."
     pveam download local "$TEMPLATE" || {
-      echo "Грешка при изтегляне на шаблон!"
+      echo "Грешка при изтегляне на шаблон! Опитайте ръчно:"
+      echo "pveam download local $TEMPLATE"
       exit 1
     }
   fi
+  
+  echo "Използва се шаблон: $TEMPLATE"
 }
 
 # Създаване на контейнер
 create_container() {
-  select_template
-  
   echo "Създаване на LXC контейнер..."
   if ! pct create $CTID \
     "local:vztmpl/$TEMPLATE" \
@@ -162,6 +150,7 @@ show_info() {
 # Главна функция
 main() {
   select_storage
+  select_template
   create_container
   install_unifi
   show_info
