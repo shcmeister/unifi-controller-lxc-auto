@@ -2,7 +2,7 @@
 
 # ==============================================
 # Автоматична инсталация на UniFi Controller в LXC
-# Адаптация на скрипта от tteck/Proxmox
+# Финална версия
 # ==============================================
 
 # Проверка за root
@@ -30,12 +30,13 @@ CORES=2
 select_storage() {
   clear
   echo "Налични storage устройства:"
+  # Използваме pvesm status вместо pvesm list
   pvesm status | awk 'NR>1 {print $1}'
   echo ""
   
   while true; do
     read -p "Моля изберете storage устройство: " STORAGE
-    if pvesm list | grep -q "^$STORAGE "; then
+    if pvesm status | awk 'NR>1 {print $1}' | grep -q "^$STORAGE$"; then
       break
     else
       echo "Грешка: Невалиден storage. Опитайте отново."
@@ -47,8 +48,8 @@ select_storage() {
 create_container() {
   echo "Създаване на LXC контейнер..."
   pct create $CTID \
-    -storage $STORAGE \
-    -hostname $HOSTNAME \
+    -storage "$STORAGE" \
+    -hostname "$HOSTNAME" \
     -password "$PASSWORD" \
     -memory $MEMORY \
     -swap $SWAP \
@@ -57,7 +58,7 @@ create_container() {
     -unprivileged 1 \
     -features nesting=1 \
     -ostype debian \
-    -rootfs $STORAGE:$DISK_SIZE
+    -rootfs "$STORAGE:$DISK_SIZE"
 
   pct start $CTID
   sleep 5
@@ -68,10 +69,10 @@ install_unifi() {
   echo "Инсталиране на UniFi Controller..."
   pct exec $CTID -- bash -c '
     apt-get update && apt-get install -y wget
-    wget -qO - https://www.mongodb.org/static/pgp/server-4.4.asc | apt-key add -
-    echo "deb http://repo.mongodb.org/apt/debian buster/mongodb-org/4.4 main" > /etc/apt/sources.list.d/mongodb-org.list
-    wget -qO - https://www.ui.com/downloads/unifi/debian/unifi-repo.gpg | apt-key add -
-    echo "deb https://www.ui.com/downloads/unifi/debian stable ubiquiti" > /etc/apt/sources.list.d/100-unifi.list
+    wget -qO - https://www.mongodb.org/static/pgp/server-4.4.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/mongodb-archive-keyring.gpg] http://repo.mongodb.org/apt/debian buster/mongodb-org/4.4 main" > /etc/apt/sources.list.d/mongodb-org.list
+    wget -qO - https://www.ui.com/downloads/unifi/debian/unifi-repo.gpg | gpg --dearmor -o /usr/share/keyrings/unifi-repo.gpg
+    echo "deb [signed-by=/usr/share/keyrings/unifi-repo.gpg] https://www.ui.com/downloads/unifi/debian stable ubiquiti" > /etc/apt/sources.list.d/100-unifi.list
     apt-get update && apt-get install -y openjdk-8-jre-headless unifi
     systemctl start unifi
   '
@@ -88,6 +89,7 @@ show_info() {
   echo " UniFi Controller: https://$IP:8443"
   echo " Потребител: admin"
   echo " Парола: $PASSWORD"
+  echo " Storage: $STORAGE"
   echo "=============================================="
   echo " Забележка: Може да отнеме 2-3 минути"
   echo " докато услугата се стартира напълно."
